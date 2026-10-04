@@ -43,5 +43,6 @@ export function snapshotToMeterSeed(snapshot: CostSnapshot) {
     buckets: snapshot.buckets,
     routes: snapshot.routes,
     sessions: snapshot.sessions,
+    bands: snapshot.bands ?? {},
   }
 }

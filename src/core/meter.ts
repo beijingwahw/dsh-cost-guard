@@ -5,7 +5,7 @@
  */
 
 import type { BudgetScope, UsageBucket, UsageEntry } from './types.js'
-import { emptyBucket } from './types.js'
+import { emptyBucket, BASE_BAND } from './types.js'
 import { dayKey, monthKey } from './clock.js'
 
 export interface MeterSnapshot {
@@ -13,12 +13,15 @@ export interface MeterSnapshot {
   buckets: Partial<Record<BudgetScope, UsageBucket>>
   routes: Record<string, UsageBucket>
   sessions: Record<string, UsageBucket>
+  /** 按峰谷时段累计（bandId -> 桶）。 */
+  bands: Record<string, UsageBucket>
 }
 
 export class Meter {
   private readonly buckets: Partial<Record<BudgetScope, UsageBucket>> = {}
   private readonly routes: Record<string, UsageBucket> = {}
   private readonly sessions: Record<string, UsageBucket> = {}
+  private readonly bands: Record<string, UsageBucket> = {}
 
   constructor(
     private readonly tzOffsetMin: number,
@@ -28,6 +31,7 @@ export class Meter {
       this.buckets = seed.buckets ? { ...seed.buckets } : {}
       this.routes = { ...seed.routes }
       this.sessions = { ...seed.sessions }
+      this.bands = seed.bands ? { ...seed.bands } : {}
     }
   }
 
@@ -47,6 +51,8 @@ export class Meter {
     bucket.outputTokens += e.usage.outputTokens
     bucket.totalTokens += e.totalTokens
     bucket.cost += e.cost
+    // ?? 0：兼容旧版快照 / 缺失积分字段的条目，避免 NaN 污染累计
+    bucket.credits += e.credits ?? 0
   }
 
   /** 记录一次模型调用用量。 */
@@ -57,6 +63,14 @@ export class Meter {
     if (sessionId) {
       this.add(this.bucketOf('session'), entry)
     }
+    // 峰谷时段维度（实时追踪分带累计）
+    const bandId = entry.band ?? BASE_BAND
+    let bb = this.bands[bandId]
+    if (!bb) {
+      bb = emptyBucket()
+      this.bands[bandId] = bb
+    }
+    this.add(bb, entry)
     // 路由与会话明细
     const routeKey = `${entry.route.provider}/${entry.route.model}`
     let rb = this.routes[routeKey]
@@ -91,7 +105,16 @@ export class Meter {
     for (const [k, v] of Object.entries(this.routes)) routes[k] = { ...v }
     const sessions: Record<string, UsageBucket> = {}
     for (const [k, v] of Object.entries(this.sessions)) sessions[k] = { ...v }
-    return { buckets, routes, sessions }
+    const bands: Record<string, UsageBucket> = {}
+    for (const [k, v] of Object.entries(this.bands)) bands[k] = { ...v }
+    return { buckets, routes, sessions, bands }
+  }
+
+  /** 按峰谷时段读取累计（bandId -> 桶），供实时追踪展示。 */
+  bandTotals(): Record<string, UsageBucket> {
+    const out: Record<string, UsageBucket> = {}
+    for (const [k, v] of Object.entries(this.bands)) out[k] = { ...v }
+    return out
   }
 }
 
@@ -103,6 +126,8 @@ export class Meter {
 export class WindowMeter {
   private readonly days: Map<string, UsageBucket> = new Map()
   private readonly months: Map<string, UsageBucket> = new Map()
+  private readonly dayBandBuckets: Map<string, Record<string, UsageBucket>> = new Map()
+  private readonly monthBandBuckets: Map<string, Record<string, UsageBucket>> = new Map()
 
   constructor(
     private readonly tzOffsetMin: number,
@@ -125,6 +150,31 @@ export class WindowMeter {
     }
     this.add(db, entry)
     this.add(mb, entry)
+
+    // 峰谷时段分布（日 / 月）
+    const bandId = entry.band ?? BASE_BAND
+    let dbs = this.dayBandBuckets.get(dk)
+    if (!dbs) {
+      dbs = {}
+      this.dayBandBuckets.set(dk, dbs)
+    }
+    let dbBucket = dbs[bandId]
+    if (!dbBucket) {
+      dbBucket = emptyBucket()
+      dbs[bandId] = dbBucket
+    }
+    this.add(dbBucket, entry)
+    let mbs = this.monthBandBuckets.get(mk)
+    if (!mbs) {
+      mbs = {}
+      this.monthBandBuckets.set(mk, mbs)
+    }
+    let mbBucket = mbs[bandId]
+    if (!mbBucket) {
+      mbBucket = emptyBucket()
+      mbs[bandId] = mbBucket
+    }
+    this.add(mbBucket, entry)
   }
 
   private add(bucket: UsageBucket, e: UsageEntry): void {
@@ -134,6 +184,8 @@ export class WindowMeter {
     bucket.outputTokens += e.usage.outputTokens
     bucket.totalTokens += e.totalTokens
     bucket.cost += e.cost
+    // ?? 0：兼容旧版快照 / 缺失积分字段的条目，避免 NaN 污染累计
+    bucket.credits += e.credits ?? 0
   }
 
   day(key: string): UsageBucket {
@@ -150,6 +202,34 @@ export class WindowMeter {
 
   thisMonth(): UsageBucket {
     return this.month(monthKey(this.now(), this.tzOffsetMin))
+  }
+
+  /** 今日按峰谷时段分布（bandId -> 桶）。 */
+  todayBands(): Record<string, UsageBucket> {
+    return this.dayBands(dayKey(this.now(), this.tzOffsetMin))
+  }
+
+  /** 本月按峰谷时段分布（bandId -> 桶）。 */
+  thisMonthBands(): Record<string, UsageBucket> {
+    return this.monthBands(monthKey(this.now(), this.tzOffsetMin))
+  }
+
+  /** 某日按峰谷时段分布。 */
+  dayBands(key: string): Record<string, UsageBucket> {
+    const inner = this.dayBandBuckets.get(key)
+    if (!inner) return {}
+    const out: Record<string, UsageBucket> = {}
+    for (const [k, v] of Object.entries(inner)) out[k] = { ...v }
+    return out
+  }
+
+  /** 某月按峰谷时段分布。 */
+  monthBands(key: string): Record<string, UsageBucket> {
+    const inner = this.monthBandBuckets.get(key)
+    if (!inner) return {}
+    const out: Record<string, UsageBucket> = {}
+    for (const [k, v] of Object.entries(inner)) out[k] = { ...v }
+    return out
   }
 
   recentDays(n: number): Array<{ key: string; bucket: UsageBucket }> {

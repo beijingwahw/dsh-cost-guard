@@ -55,3 +55,30 @@ export function monthKey(ms: number, tzOffsetMin: number = DEFAULT_TZ_OFFSET_MIN
   const m = String(shifted.getUTCMonth() + 1).padStart(2, '0')
   return `${y}-${m}`
 }
+
+/**
+ * 今日结束时刻（epoch ms）：本时区下一个 00:00 的瞬间。
+ * 用于预测引擎的「今日结束」目标时刻。
+ */
+export function endOfDayEpoch(ms: number, tzOffsetMin: number = DEFAULT_TZ_OFFSET_MIN): number {
+  const shifted = new Date(ms + tzOffsetMin * 60_000)
+  const nextLocalMidnight = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate() + 1)
+  return nextLocalMidnight - tzOffsetMin * 60_000
+}
+
+/**
+ * 本月结束时刻（epoch ms）：本时区下一个月的 00:00 的瞬间。
+ * 用于预测引擎的「月末」目标时刻。
+ */
+export function endOfMonthEpoch(ms: number, tzOffsetMin: number = DEFAULT_TZ_OFFSET_MIN): number {
+  const shifted = new Date(ms + tzOffsetMin * 60_000)
+  const nextLocalMonth = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth() + 1, 1)
+  return nextLocalMonth - tzOffsetMin * 60_000
+}
+
+/** 本月剩余自然日数（含今天，最少 1 天）。 */
+export function daysLeftInMonth(ms: number, tzOffsetMin: number = DEFAULT_TZ_OFFSET_MIN): number {
+  const end = endOfMonthEpoch(ms, tzOffsetMin)
+  const days = Math.ceil((end - ms) / 86_400_000)
+  return Math.max(1, days)
+}

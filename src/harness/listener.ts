@@ -10,8 +10,19 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import type { TokenUsageLike, UsageEntry } from '../core/types.js'
-import { computeCost, billedTokens, priceFor, type PricingTable } from '../core/pricing.js'
+import type { TokenUsageLike, TimeBand, UsageEntry } from '../core/types.js'
+import { BASE_BAND } from '../core/types.js'
+import {
+  computeCost,
+  computeCredits,
+  billedTokens,
+  priceFor,
+  priceForAt,
+  bandIdForEpoch,
+  buildBandPriceTable,
+  type BandPriceTable,
+  type PricingTable,
+} from '../core/pricing.js'
 import type { Meter } from '../core/meter.js'
 import type { WindowMeter } from '../core/meter.js'
 
@@ -62,11 +73,20 @@ export function parseSessionEvent(event: SessionEvent & { sessionId?: string }):
   return base
 }
 
+/** 峰谷计价上下文：时段表 + 事件时区偏移。 */
+export interface BandPricingContext {
+  /** 时段定义；为空时全部按 BASE_BAND（基准价），行为与旧版一致。 */
+  bands?: TimeBand[]
+  /** 事件时区偏移（分钟），用于把事件时间换算为本地分钟选带。 */
+  tzOffsetMin?: number
+}
+
 /** 由解析后的宿主事件构造计价入账条目。 */
 export function toUsageEntry(
   parsed: ParsedSessionEvent,
   routes: PricingTable,
   fallbackRoute: { provider: string; model: string },
+  bandCtx?: BandPricingContext,
 ): UsageEntry | undefined {
   if (!parsed.usage || parsed.usage.inputTokens + parsed.usage.outputTokens + (parsed.usage.cacheReadTokens ?? 0) <= 0) {
     return undefined
@@ -75,12 +95,17 @@ export function toUsageEntry(
     provider: parsed.provider ?? fallbackRoute.provider,
     model: parsed.model ?? fallbackRoute.model,
   }
-  const { price } = priceFor(routes, route)
   const usage = {
     inputTokens: parsed.usage.inputTokens,
     outputTokens: parsed.usage.outputTokens,
     cacheReadTokens: parsed.usage.cacheReadTokens ?? 0,
   }
+  // 峰谷选带：按事件发生的本地分钟；无时段配置归 BASE_BAND
+  const tzOffsetMin = bandCtx?.tzOffsetMin ?? 0
+  const bands = bandCtx?.bands ?? []
+  const band = bands.length > 0 ? bandIdForEpoch(bands, parsed.time, tzOffsetMin) : BASE_BAND
+  const bandTable: BandPriceTable = buildBandPriceTable(bands)
+  const { price } = bands.length > 0 ? priceForAt(routes, bandTable, route, band) : priceFor(routes, route)
   return {
     time: parsed.time,
     route,
@@ -88,7 +113,9 @@ export function toUsageEntry(
     cacheReadTokens: usage.cacheReadTokens,
     reasoningTokens: parsed.usage.reasoningTokens ?? 0,
     cost: computeCost(price, usage),
+    credits: computeCredits(price, usage),
     totalTokens: billedTokens(usage),
+    band,
   }
 }
 
@@ -104,10 +131,11 @@ export function attachSessionMeter(
   sink: MeterSink,
   routes: PricingTable,
   fallbackRoute: { provider: string; model: string },
+  bandCtx?: BandPricingContext,
 ): () => void {
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
     const parsed = parseSessionEvent({ ...event, sessionId: String(session.id) })
-    const entry = toUsageEntry(parsed, routes, fallbackRoute)
+    const entry = toUsageEntry(parsed, routes, fallbackRoute, bandCtx)
     if (!entry) return
     sink.record(entry, parsed.sessionId)
     sink.recordWindow(entry)
@@ -124,14 +152,21 @@ export function attachMeters(
   windows: WindowMeter,
   routes: PricingTable,
   fallbackRoute: { provider: string; model: string },
+  bandCtx?: BandPricingContext,
+  /** 入账后的采样钩子（0.4.0：喂给预测/异常引擎），入账后调用。 */
+  sampler?: (entry: UsageEntry, sessionId?: string) => void,
 ): () => void {
   return attachSessionMeter(
     ctx,
     {
-      record: (entry, sessionId) => meter.record(entry, sessionId),
+      record: (entry, sessionId) => {
+        meter.record(entry, sessionId)
+        sampler?.(entry, sessionId)
+      },
       recordWindow: (entry) => windows.record(entry),
     },
     routes,
     fallbackRoute,
+    bandCtx,
   )
 }

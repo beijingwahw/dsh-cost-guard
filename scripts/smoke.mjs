@@ -8,6 +8,9 @@
  *   4. 真实 cordis Context 接线：session/event 事件驱动 Meter 累计、预算决策供 Guard 检查
  *   5. apply() 全装配：工具注册 + 积分单价配置生效 + 状态/摘要同时输出话费与积分
  *   6. 峰谷计费与实时追踪：按事件本地时刻选带定价、分带累计、当前时段与生效单价输出
+ *   7. 预测式治理（0.4.0）：成本轨迹 + 到期投影提前熔断、请求级预检在真实 pre-step 熔断、
+ *   8. 自适应调节治理（0.5.0）：月→日额度动态派生 + 预测背压收紧 + 今日耗尽告警/cue + 效率洞察
+ *      apply 全装配状态输出预测与尖峰展示
  *
  * 任一断言失败即非零退出；全部通过打印摘要。
  */
@@ -16,9 +19,14 @@ import { Context } from '@deepseek-ai/cordis'
 import { name, Config, apply, costGuardService } from '../lib/index.js'
 import { Meter, WindowMeter } from '../lib/core/meter.js'
 import { buildPricingTable, computeCost, computeCredits, bandIdForEpoch } from '../lib/core/pricing.js'
-import { createBudgetEvaluator, policiesFromConfig } from '../lib/core/budget.js'
+import { createBudgetEvaluator, policiesFromConfig, predictivePolicyFromConfig } from '../lib/core/budget.js'
 import { parseSessionEvent, toUsageEntry, attachMeters } from '../lib/harness/listener.js'
-import { attachGuard } from '../lib/harness/guard.js'
+import { attachGuard, budgetInputFromMeter } from '../lib/harness/guard.js'
+import { buildGovernorInput, governorConfigFromAdaptive } from '../lib/harness/adaptive.js'
+import { CostTrail } from '../lib/core/trail.js'
+import { MadDetector } from '../lib/core/anomaly.js'
+import { buildForecastContext, preStepEstimate } from '../lib/harness/predictive.js'
+import { buildCostStatus } from '../lib/harness/tool.js'
 
 const ok = (label) => console.log(`  ✓ ${label}`)
 let step = 0
@@ -239,5 +247,230 @@ assert.ok(bsummary.includes('当前时段: '), '摘要输出当前时段')
 assert.ok(bsummary.includes('今日分带: peak 6'), '摘要输出今日分带累计')
 ok('峰谷接入：时段选档定价、分带累计、当前时段与生效单价实时输出正确')
 
+// ---- 7. 预测式治理（0.4.0）----
+console.log(`\n[${++step}] 预测式治理（轨迹采样 + 到期投影提前熔断 + 真实 pre-step 预检）`)
+// 7.1 确定性核心链路：轨迹外推 → 预测超限 → 提前 block（真实 cordis Context）
+const pctx = new Context()
+const pmeter = new Meter(480)
+const ptrail = new CostTrail()
+const pdet = new MadDetector()
+const pruntime = {
+  trail: ptrail,
+  detector: pdet,
+  meter: pmeter,
+  pricing,
+  fallbackRoute: { provider: 'deepseek', model: 'deepseek-chat' },
+  tzOffsetMin: 480,
+}
+const fixedNow = Date.now()
+pruntime.now = () => fixedNow
+// 注入轨迹：3 分钟前花 2 元、1 分钟前再花 8 元（线性飙升），今日预算 100，warnAt=0.8
+// → 日终投影远超 80 元，提前 block
+const t1 = fixedNow - 3 * 60_000
+const t2 = fixedNow - 60_000
+pmeter.record({ ...entry, time: t1, cost: 2, credits: 20 }, 's')
+ptrail.push('day', t1, 2)
+ptrail.push('month', t1, 2)
+pmeter.record({ ...entry, time: t2, cost: 8, credits: 80 }, 's')
+ptrail.push('day', t2, 10)
+ptrail.push('month', t2, 10)
+
+const pevaluator = createBudgetEvaluator(
+  policiesFromConfig({ day: { limit: 100 } }),
+  predictivePolicyFromConfig({
+    projections: { day: { target: '今日结束', warnAt: 0.8, hardAt: 1 } },
+    spike: { level: 'extreme', action: 'block' },
+    preflight: { mode: 'expected', action: 'block', scope: 'total' },
+  }),
+)
+const pguard = attachGuard(pctx, pevaluator, pmeter, {
+  mode: 'block',
+  cancelOnBlock: true,
+  forecastInput: () => buildForecastContext(pruntime),
+})
+const pdec = pguard.inspect()
+assert.equal(pdec.action, 'block', '轨迹外推：今日结束预测成本 ≥ hardAt → 提前 block')
+assert.ok(pdec.predictive?.some((x) => x.kind === 'projection' && x.level === 'hard'), '预测触发明细包含 projection hard')
+assert.ok(pdec.predictive[0]?.detail.includes('今日结束'), '投影 detail 含目标时刻说明')
+ok('到期投影：轨迹外推 → 预测超限 → 提前熔断（未等真超支）')
+
+// 7.2 请求级预检：真实 agent/pre-step + 长消息 → 估算成本越线 → reject + cancel
+const porn = new Context()
+const pm2 = new Meter(480)
+const pe2 = createBudgetEvaluator(
+  policiesFromConfig({ total: { limit: 5 } }),
+  predictivePolicyFromConfig({ preflight: { mode: 'expected', action: 'block', scope: 'total' } }),
+)
+// 已花 4.95/5，剩余 0.05；消息字符 ~40000 → 估算 input ~10000 tokens × 2 元/1M = 0.02 元
+// expected 模式 = input + 0.5×output = 0.02 + 0.04 = 0.06 > 剩余 0.05 → 越线拦截
+pm2.record({ ...entry, cost: 4.95, credits: 49.5 }, 's')
+const pguard2 = attachGuard(porn, pe2, pm2, {
+  mode: 'block',
+  cancelOnBlock: true,
+  estimateFromMessages: (chars) => preStepEstimate(chars, pruntime),
+})
+let pcancelled = null
+const pnext = () => Promise.resolve({ kind: 'enter', messages: [] })
+porn.emit(
+  'agent/pre-step',
+  {
+    agent: { cancel: (c) => { pcancelled = c } },
+    messages: [{ role: 'user', content: 'x'.repeat(40_000) }],
+    turn: 0,
+    step: 1,
+    signal: new AbortController().signal,
+  },
+  pnext,
+)
+assert.equal(pguard2.lastDecision.action, 'block', '预检：本请求估算将越线 → block（未发出即拦截）')
+assert.ok(pguard2.lastDecision.predictive?.some((x) => x.kind === 'preflight'), '决策含 preflight 触发明细')
+assert.ok(pcancelled && pcancelled.kind === 'hook', '预检熔断同样触发 agent.cancel')
+ok('请求级预检：pre-step 长消息 → 花出去之前估算越线 → reject + cancel')
+
+// 7.3 apply 全装配 + predictive 配置：状态输出预测与尖峰展示
+console.log(`\n  apply 装配（config.predictive）+ 状态展示预测/尖峰`)
+const pactx = new Context()
+const ptools = []
+pactx.tools = { register: (def) => ptools.push(def) }
+apply(pactx, {
+  enabled: true,
+  mode: 'block',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {
+    'deepseek-chat': { inputPerMillion: 2, cacheReadPerMillion: 0.5, outputPerMillion: 8, creditsPerMillion: 100 },
+  },
+  budgets: { day: { limit: 100 } },
+  predictive: {
+    projections: { day: { target: '今日结束', warnAt: 0.8, hardAt: 1 } },
+    spike: { level: 'extreme', action: 'warn' },
+    preflight: { mode: 'expected', action: 'block', scope: 'total' },
+  },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+  verbose: false,
+})
+assert.ok(pactx.costGuard, 'ctx.costGuard 服务已 provide（predictive 装配）')
+pactx.emit(
+  'session/event',
+  { get id() { return 'smoke-pred' } },
+  { type: 'assistant/message', time: Date.now(), data: { usage: { inputTokens: 50_000, outputTokens: 0 } } },
+)
+const pst = pactx.costGuard.status()
+assert.ok(pst.forecast, '状态包含 forecast 段')
+assert.ok(Object.keys(pst.forecast.projections).includes('day'), 'forecast 包含 day 投影')
+assert.ok(pst.forecast.projections.day.expected >= pst.day.cost, '投影成本 ≥ 已花费（非负外推）')
+assert.equal(pst.forecast.samples, 1, '轨迹采样点计数正确')
+assert.ok(['normal', 'spike', 'extreme'].includes(pst.forecast.spike), '尖峰级别字段合法')
+const psummary = pactx.costGuard.summary()
+assert.ok(psummary.includes('预测:') || psummary.includes('今日结束'), '摘要可输出预测行（样本 1 点可能不足以投影，允许缺省）')
+ok('apply 全装配：predictive 配置生效，状态输出 forecast 段与尖峰级别，摘要含预测行')
+
+// ---- 8. 自适应调节治理（0.5.0）：动态额度 + 背压水位 + 成本感知 cue + 效率洞察 ----
+console.log(`\n[${++step}] 自适应调节治理（月度→日额度动态派生 + 消费速率背压 + 效率洞察）`)
+// 8.1 确定性核心链路：真实 Meter/WindowMeter + governor → 预测超支收紧日额度并触发 exhausted
+const g8ctx = new Context()
+const g8meter = new Meter(480)
+const g8windows = new WindowMeter(480)
+const agoraCfg = governorConfigFromAdaptive({ monthLimit: 300, backpressure: 0.5 }, 0)
+assert.ok(agoraCfg, 'governor 配置归一化成功')
+assert.equal(agoraCfg.monthLimit, 300, 'monthLimit 生效')
+// 已花 60/月 与 60/今天；月末预测 400 > 月预算 300 → 背压收紧
+g8meter.record({ ...entry, cost: 60, credits: 600 }, 's')
+g8windows.record({ ...entry, cost: 60, credits: 600 })
+// 固定时钟：2026-10-20 12:00 +08（离 10 月末还有 12 天），保证跨日运行确定性
+const g8Now = Date.UTC(2026, 9, 20, 4, 0, 0)
+const ainput = buildGovernorInput(agoraCfg, { meter: g8meter, windows: g8windows, tzOffsetMin: 480, now: () => g8Now }, {
+  projected: { month: 400 },
+})
+assert.ok(ainput, '自适应输入构造成功')
+assert.ok(ainput.governor.exhausted, '今日花费 ≥ 动态日额度 → exhausted')
+assert.ok(ainput.governor.pressure < 1, '预测月末超支 → 背压收紧（pressure < 1）')
+assert.ok(ainput.governor.dayAllowance < 60, '动态日额度低于今日已花费（背压收紧）')
+ok('8.1 月度→日额度动态派生 + 预测背压：压力 < 1、日额度收紧、今日耗尽识别正确')
+// 8.2 真实 cordis Context：adaptive 决策把动态水位用于 day scope → 今日耗尽告警
+const aev = createBudgetEvaluator(
+  policiesFromConfig({ day: { limit: 100 } }),
+  predictivePolicyFromConfig({ adaptive: {} }),
+)
+const adec = aev.decide(budgetInputFromMeter(g8meter, undefined, ainput))
+assert.equal(adec.action, 'warn', '自适应治理：今日耗尽触发告警（warn）')
+assert.ok(adec.adaptive, '决策输出 adaptive 段（动态水位 + cue）')
+assert.equal(adec.adaptive.cue, 'minimal', '今日额度耗尽 → cue=minimal（最小化）')
+assert.ok(adec.adaptive.governor.exhausted, 'adaptive 段含 exhausted 状态')
+const aguard = attachGuard(g8ctx, aev, g8meter, {
+  mode: 'block',
+  cancelOnBlock: true,
+  adaptiveInput: (fc) => buildGovernorInput(agoraCfg, { meter: g8meter, windows: g8windows, tzOffsetMin: 480, now: () => g8Now }, fc),
+  forecastInput: () => ({ projected: { month: 400 } }),
+})
+const aus = aguard.inspect()
+assert.equal(aus.action, 'warn', 'Guard 经 adaptive 接线：今日耗尽 -> warn（未硬熔断）')
+ok('8.2 真实 cordis Context：adaptive 接线，决策带动态水位 + cue，Guard 正常告警')
+// 8.3 apply 全装配：自适应 + 效率洞察展示
+console.log(`\n  apply 装配（config.adaptive）+ 状态展示自适应与效率洞察`)
+const aactx = new Context()
+const atools = []
+aactx.tools = { register: (def) => atools.push(def) }
+apply(aactx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {
+    'deepseek-chat': { inputPerMillion: 2, cacheReadPerMillion: 0.5, outputPerMillion: 8 },
+    'deepseek-reasoner': { inputPerMillion: 4, cacheReadPerMillion: 1, outputPerMillion: 16 },
+  },
+  budgets: { month: { limit: 300 } },
+  adaptive: { backpressure: 0.5 },
+  predictive: { adaptive: { scope: 'day', onExhausted: 'warn' } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-reasoner',
+  enableTool: true,
+  verbose: false,
+})
+assert.ok(aactx.costGuard, 'ctx.costGuard 服务已 provide（adaptive 装配）')
+assert.equal(atools.length, 1, '工具注册正常')
+aactx.emit(
+  'session/event',
+  { get id() { return 'smoke-adapt' } },
+  { type: 'assistant/message', time: Date.now(), data: { usage: { inputTokens: 50_000, outputTokens: 50_000 } } },
+)
+const ast = aactx.costGuard.status()
+assert.ok(ast.adaptive, '状态包含 adaptive 段')
+assert.ok(['calm', 'frugal', 'minimal'].includes(ast.adaptive.cue), 'cue 级别合法')
+assert.equal(typeof ast.adaptive.pressure, 'number', '背压因子为数字')
+assert.ok(ast.efficiency, '状态包含 efficiency 段')
+assert.ok(ast.efficiency.routes.length > 0, '效率洞察含路由指标')
+const aIn = ast.efficiency.routes.find((r) => r.route.includes('deepseek-reasoner'))
+assert.ok(aIn && aIn.costPerKOutput > 0, '每千输出 token 成本已计算')
+const asummary = aactx.costGuard.summary()
+assert.ok(typeof asummary === 'string' && asummary.length > 0, '摘要可用')
+// 8.4 成本效率洞察：请求分布 + 替代节约
+const a2ctx = new Context()
+const a2meter = new Meter(480)
+const a2win = new WindowMeter(480)
+const det2 = new MadDetector()
+for (const c of [1, 1, 2, 2, 30]) det2.push(c) // 长尾请求构成分布
+const a2eval = createBudgetEvaluator(policiesFromConfig({ day: { limit: 1000 } }))
+const a2guard = { lastDecision: { action: 'allow', triggers: [] }, inspect: () => ({ action: 'allow', triggers: [] }) }
+const a2pricing = buildPricingTable({
+  'deepseek-chat': { inputPerMillion: 2, cacheReadPerMillion: 0.5, outputPerMillion: 8 },
+  'deepseek-reasoner': { inputPerMillion: 4, cacheReadPerMillion: 1, outputPerMillion: 16 },
+})
+// chat 路由 10 元；若换 reasoner：input 50万×4/1M + output 50万×16/1M = 2 + 8 = 10 元 -> 无节约（不产出建议）
+a2meter.record({ ...entry, route: { provider: 'deepseek', model: 'deepseek-chat' }, time: Date.now(), cost: 10, credits: 100, totalTokens: 1_000_000, usage: { inputTokens: 500_000, outputTokens: 500_000 } }, 's')
+const st2 = buildCostStatus(a2meter, a2win, a2eval, a2guard, {
+  baseline: a2pricing,
+  tzOffsetMin: 480,
+  costSamples: det2,
+})
+assert.ok(st2.efficiency.distribution, '请求成本分布已计算（5 样本）')
+assert.equal(st2.efficiency.distribution.n, 5, '分布样本数正确')
+assert.ok(st2.efficiency.distribution.p95 > st2.efficiency.distribution.p50, 'P95 ≥ P50（长尾分布）')
+assert.ok(Array.isArray(st2.efficiency.replacement), '替代节约建议字段存在')
+ok('8.4 效率洞察：请求成本分布（P50/P95/Max）+ 路由每千输出 token 成本正确')
+
 console.log(`\n[${++step}] 冒烟通过 ✓`)
-console.log('dsh-cost-guard@0.3.0 lib 产物在真实 Node 环境运行正常（金额 + 积分双维度统计 + 峰谷计费实时追踪）')
+console.log('dsh-cost-guard@0.5.0 lib 产物在真实 Node 环境运行正常（实时计量 + 峰谷计费 + 预测式治理 + 自适应调节 + 效率洞察）')

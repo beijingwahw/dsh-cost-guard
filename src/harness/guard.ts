@@ -4,6 +4,12 @@
  * 命中硬限 -> 返回 reject（阻止进入下一步）并调用 agent.cancel 终止轮次；
  * 命中告警水位 -> 允许继续但记录告警日志，通知宿主。
  *
+ * 0.4.0 预测式治理：
+ * - 决策输入可携带 forecast（到期投影 / 尖峰 / 请求预检估算），
+ *   由 Predictor 策略决定是否提前告警或熔断（默认不启用，语义与 0.3.0 一致）。
+ * - 请求预检：pre-step 可拿到消息序列，按其字符量估算本次调用成本，
+ *   在『花出去之前』判断是否会烧穿指定预算。
+ *
  * 设计说明：
  * - agent/pre-step 是请求推导前唯一的 waterfall 链，返回 reject 不会打开步骤，
  *   这是『阻止模型继续烧钱』最干净的位置。
@@ -16,7 +22,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
 import type { BudgetDecision, BudgetScope } from '../core/types.js'
-import type { BudgetEvaluator } from '../core/budget.js'
+import type { BudgetEvaluator, BudgetInput, PredictivePolicy } from '../core/budget.js'
+import type { RequestEstimate } from '../core/anomaly.js'
 import type { Meter } from '../core/meter.js'
 
 export type GuardMode = 'off' | 'warn' | 'block'
@@ -28,15 +35,30 @@ export interface GuardOptions {
   cancelOnBlock: boolean
   /** 告警补充回调（通知宿主 / 桌面通知 / 日志等）。 */
   onViolation?: (decision: BudgetDecision, scope: BudgetScope) => void
+  /** 预测式治理策略（0.4.0）；缺省 = 0.3.0 语义。 */
+  predictive?: PredictivePolicy
+  /** 预测上下文构造器：当前 meter/trail/detector 的 forecast 输入（可选）。 */
+  forecastInput?: () => BudgetInput['forecast']
+  /** 请求预检：按消息字符量估算本次调用成本（可选；估算不可得时返回 undefined）。 */
+  estimateFromMessages?: (chars: number) => RequestEstimate | undefined
+  /** 自适应调节输入（0.5.0）：由 governor 计算的动态额度与水位（可选；需要 forecast 时接收）。 */
+  adaptiveInput?: (forecast?: BudgetInput['forecast']) => BudgetInput['adaptive'] | undefined
 }
 
-/** 由 Meter 快照构造预算评估输入。 */
-export function budgetInputFromMeter(meter: Meter): { spent: Partial<Record<BudgetScope, number>> } {
+/** 由 Meter 快照（+ 可选预测上下文）构造预算评估输入。 */
+export function budgetInputFromMeter(
+  meter: Meter,
+  forecast?: BudgetInput['forecast'],
+  adaptive?: BudgetInput['adaptive'],
+): BudgetInput {
   const spent: Partial<Record<BudgetScope, number>> = {}
   for (const scope of ['total', 'day', 'month', 'session'] as const) {
     spent[scope] = meter.spent(scope).cost
   }
-  return { spent }
+  const input: BudgetInput = { spent }
+  if (forecast && Object.keys(forecast).length > 0) input.forecast = forecast
+  if (adaptive) input.adaptive = adaptive
+  return input
 }
 
 export interface GuardHandle {
@@ -53,14 +75,28 @@ export function attachGuard(
   meter: Meter,
   options: GuardOptions,
 ): GuardHandle {
+  const decisionWith = (estimate?: RequestEstimate): BudgetDecision => {
+    const forecast = options.forecastInput?.()
+    const merged: BudgetInput['forecast'] = forecast ? { ...forecast } : {}
+    if (estimate) merged.estimate = estimate
+    const adaptive = options.adaptiveInput?.(merged)
+    return evaluator.decide(budgetInputFromMeter(meter, merged, adaptive))
+  }
+
+  const inspectAlways = (): BudgetDecision => {
+    const forecast = options.forecastInput?.()
+    const adaptive = options.adaptiveInput?.(forecast)
+    return evaluator.decide(budgetInputFromMeter(meter, forecast, adaptive))
+  }
+
   const state: GuardHandle = {
     lastDecision: { action: 'allow', triggers: [] },
-    inspect: () => evaluator.decide(budgetInputFromMeter(meter)),
+    inspect: inspectAlways,
   }
 
   if (options.mode === 'off') {
     // 只计量不干预：每次决策仅记录，不挂监听
-    state.inspect = () => evaluator.decide(budgetInputFromMeter(meter))
+    state.inspect = inspectAlways
     return state
   }
 
@@ -70,14 +106,28 @@ export function attachGuard(
       payload: { agent: Agent; messages: UserMessage[]; turn: number; step: number; signal: AbortSignal },
       next: () => Promise<PreStepDecision>,
     ): Promise<PreStepDecision> => {
-      const decision = evaluator.decide(budgetInputFromMeter(meter))
+      // 请求级预检：消息序列字符量 -> 估算本次调用成本
+      let estimate: RequestEstimate | undefined
+      let chars = 0
+      try {
+        chars = JSON.stringify(payload.messages ?? []).length
+      } catch {
+        chars = 0
+      }
+      estimate = options.estimateFromMessages?.(chars)
+
+      const decision = decisionWith(estimate)
       state.lastDecision = decision
 
       if (decision.action === 'block') {
         const hard = decision.triggers.find((t) => t.level === 'hard')
-        const scope = hard?.scope ?? 'total'
+        const predictiveHard = decision.predictive?.find((t) => t.level === 'hard')
+        const scope = hard?.scope ?? predictiveHard?.scope ?? 'total'
         const reason = `[cost-guard] ${scope} 预算已耗尽 (${hard ? hard.spent.toFixed(2) : '?'}/${hard ? hard.limit.toFixed(2) : '?'})，已熔断。`
         ctx.logger('cost-guard').warn(reason)
+        if (predictiveHard && !hard) {
+          ctx.logger('cost-guard').warn(`[cost-guard] 预测式熔断：${predictiveHard.detail}`)
+        }
         options.onViolation?.(decision, scope)
         if (options.cancelOnBlock) {
           try {
@@ -91,11 +141,16 @@ export function attachGuard(
 
       if (decision.action === 'warn') {
         const w = decision.triggers.find((t) => t.level === 'warn')
+        const predictiveWarn = decision.predictive?.find((t) => t.level === 'warn')
         if (w) {
           ctx.logger('cost-guard').warn(
             `[cost-guard] ${w.scope} 预算达到 ${Math.round(w.ratio * 100)}% (${w.spent.toFixed(2)}/${w.limit.toFixed(2)})，请留意。`,
           )
           options.onViolation?.(decision, w.scope)
+        }
+        if (predictiveWarn && !w) {
+          ctx.logger('cost-guard').warn(`[cost-guard] 预测式告警：${predictiveWarn.detail}`)
+          options.onViolation?.(decision, predictiveWarn.scope ?? 'total')
         }
       }
 
