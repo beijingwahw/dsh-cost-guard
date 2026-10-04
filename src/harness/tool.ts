@@ -30,6 +30,8 @@ import { buildForecast } from '../core/forecast.js'
 import { endOfDayEpoch, endOfMonthEpoch } from '../core/clock.js'
 import { requestCostDistribution, routeEfficiency, estimateReplacement } from '../core/efficiency.js'
 import type { GuardHandle } from './guard.js'
+import { buildCachePanel, formatCacheLines } from './cache.js'
+import type { CachePanelPayload } from './cache.js'
 
 /** 单维度消耗：话费（金额）与积分独立。 */
 export interface CostDimension {
@@ -108,6 +110,8 @@ export interface CostStatusPayload {
     /** 路由替代节约建议。 */
     replacement: Array<{ from: string; to: string; currentCost: number; replacementCost: number; saving: number; suggestion: string }>
   }
+  /** 缓存维度计量（0.6.0；仅 cache.enabled=true 时存在，缺省 undefined = 零回归）。 */
+  cache?: CachePanelPayload
 }
 
 /** buildCostStatus 的可选上下文：峰谷时段 + 基准价表 + 时区与时钟。 */
@@ -124,6 +128,8 @@ export interface BandStatusContext {
   predictive?: { trail: CostTrail; detector: MadDetector }
   /** 单请求成本样本（0.5.0；成本分布统计），提供 detector.window() 即可。 */
   costSamples?: { window: () => number[] }
+  /** 缓存维度计量（0.6.0；仅 cache.enabled=true 时注入，缺省不输出缓存段）。 */
+  cache?: { metrics: import('../core/cache-metrics.js').CacheMetrics; hint: import('../core/cache-hint.js').CacheHintDetector }
 }
 
 /** 构造路由查询对象：'provider/model' 或裸 'model'。 */
@@ -271,6 +277,10 @@ export function buildCostStatus(
     replacement,
   }
 
+  // —— 缓存维度计量（0.6.0）——
+  const cacheCtx = ctx?.cache
+  const cache = cacheCtx ? buildCachePanel(cacheCtx.metrics, cacheCtx.hint) : undefined
+
   return {
     total: dimension(total),
     day: dimension(day),
@@ -293,6 +303,7 @@ export function buildCostStatus(
     forecast: predict,
     adaptive,
     efficiency,
+    cache,
   }
 }
 
@@ -401,6 +412,10 @@ export function formatStatusSummary(status: CostStatusPayload): string {
     for (const r of eff.replacement) {
       lines.push(r.suggestion)
     }
+  }
+  // 缓存维度计量（0.6.0；仅启用时输出）
+  if (status.cache) {
+    for (const line of formatCacheLines(status.cache)) lines.push(line)
   }
   const top = Object.entries(status.routes)
     .sort((a, b) => b[1].cost - a[1].cost)

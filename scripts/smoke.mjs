@@ -27,6 +27,10 @@ import { CostTrail } from '../lib/core/trail.js'
 import { MadDetector } from '../lib/core/anomaly.js'
 import { buildForecastContext, preStepEstimate } from '../lib/harness/predictive.js'
 import { buildCostStatus } from '../lib/harness/tool.js'
+import { CacheMetrics } from '../lib/core/cache-metrics.js'
+import { CacheHintDetector } from '../lib/core/cache-hint.js'
+import { CachePricingEngine } from '../lib/core/cache-pricing.js'
+import { attachCacheMeter, buildCachePanel, formatCacheLines, readCacheUsage } from '../lib/harness/cache.js'
 
 const ok = (label) => console.log(`  ✓ ${label}`)
 let step = 0
@@ -472,5 +476,172 @@ assert.ok(st2.efficiency.distribution.p95 > st2.efficiency.distribution.p50, 'P9
 assert.ok(Array.isArray(st2.efficiency.replacement), '替代节约建议字段存在')
 ok('8.4 效率洞察：请求成本分布（P50/P95/Max）+ 路由每千输出 token 成本正确')
 
+// ---- 9. 缓存维度计量（0.6.0）：三通道解析 + 命中率/收益/不确定 + 面板输出 ----
+console.log(`\n[${++step}] 缓存维度计量（真实 Context 事件 → 命中率 / 收益 / 不确定 / 面板输出）`)
+// 9.1 apply 全装配 + cache.enabled=true：事件驱动缓存账本
+const cctx = new Context()
+const ctools = []
+cctx.tools = { register: (def) => ctools.push(def) }
+apply(cctx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {
+    'deepseek-chat': { inputPerMillion: 2, cacheReadPerMillion: 0.5, outputPerMillion: 8 },
+  },
+  cache: {
+    enabled: true,
+    hint: { minRepeat: 2, minSaving: 0.05 },
+  },
+  budgets: { total: { limit: 100 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+  verbose: false,
+})
+assert.ok(cctx.costGuard, 'ctx.costGuard 服务已 provide（cache 装配）')
+// 事件①：OpenAI 原生缓存字段（details.cached_tokens）
+cctx.emit(
+  'session/event',
+  { get id() { return 'smoke-cache-1' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: {
+      usage: {
+        prompt_tokens: 1_000_000,
+        completion_tokens: 100_000,
+        prompt_tokens_details: { cached_tokens: 300_000 },
+      },
+    },
+  },
+)
+// 事件②：DSH 归一化 inputTokens + cacheReadTokens
+cctx.emit(
+  'session/event',
+  { get id() { return 'smoke-cache-2' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { usage: { inputTokens: 500_000, outputTokens: 50_000, cacheReadTokens: 100_000 } },
+  },
+)
+// 事件③：缺失缓存字段 → 回退未命中 + 不确定（不入命中率）
+cctx.emit(
+  'session/event',
+  { get id() { return 'smoke-cache-3' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { usage: { inputTokens: 400_000, outputTokens: 50_000 } },
+  },
+)
+const cst = cctx.costGuard.status()
+assert.ok(cst.cache, '状态包含 cache 段（cache.enabled=true）')
+// Token 加权命中率：可信输入 = 1M(事件①0.3M 命中) + 500k+100k(事件②0.1M 命中) = 1.6M；命中 = 0.4M
+assert.equal(cst.cache.summary.inputTotal, 1_600_000, '输入 token 汇总仅含可信请求')
+assert.equal(cst.cache.summary.hitTotal, 400_000, '缓存命中 token 汇总')
+assert.ok(Math.abs(cst.cache.summary.hitRate - 0.25) < 1e-9, 'Token 加权命中率 = 0.4M/1.6M = 25%')
+assert.equal(cst.cache.summary.uncertainCount, 1, '缺失缓存字段的事件计为不确定')
+assert.ok(cst.cache.summary.savingTotal > 0, '缓存收益 > 0（相对全未命中基线）')
+// 面板与摘要行
+const clines = formatCacheLines(cst.cache)
+assert.ok(clines.some((l) => l.includes('缓存: 命中率 25.0%') && l.includes('不确定 1 次')), '面板行输出命中率与不确定数')
+const csummary = cctx.costGuard.summary()
+assert.ok(csummary.includes('缓存: 命中率 25.0%'), '摘要输出缓存命中率行')
+ok('缓存计量全链路：原生字段/归一化字段解析 + 命中率 + 收益 + 不确定计数 + 面板/摘要输出正确')
+
+// 9.2 独立引擎链路：收益 = baseline - cost 可复算
+const ceng = new CachePricingEngine()
+const cmetrics = new CacheMetrics()
+const chint = new CacheHintDetector(ceng, { minRepeat: 3, minSaving: 0.5 })
+const cctx2 = new Context()
+attachCacheMeter(cctx2, { tzOffsetMin: 480, pricing: ceng, metrics: cmetrics, hint: chint })
+// 指定路由 deepseek-flash（内置价表 flash 空闲：hit=0.02 / miss=1.0 / out=4.0）
+cctx2.emit(
+  'session/event',
+  { get id() { return 'smoke-cache-hdr' } },
+  { type: 'request/header', time: Date.UTC(2026, 8, 7, 22, 0), data: { header: { config: { provider: 'deepseek', model: 'deepseek-flash' } } } },
+)
+// 全命中 1M 输入 + 100k 输出（北京凌晨 -> 空闲）
+cctx2.emit(
+  'session/event',
+  { get id() { return 'smoke-cache-4' } },
+  {
+    type: 'assistant/message',
+    time: Date.UTC(2026, 8, 7, 22, 0),
+    data: { usage: { prompt_tokens: 1_000_000, completion_tokens: 100_000, prompt_tokens_details: { cached_tokens: 1_000_000 } } },
+  },
+)
+const c2 = cmetrics.summary('global')
+assert.equal(c2.inputTotal, 1_000_000)
+assert.equal(c2.hitRate, 1)
+// 收益 = (miss - hit)单价差 × 1M = (1.0 - 0.02) = 0.98
+assert.ok(Math.abs(c2.savingTotal - 0.98) < 1e-6, '全命中收益复算 = (1.0-0.02) × 1M/1M = 0.98 元')
+ok('9.2 内置官方价复算：全命中收益 = 未命中价 - 命中价（flash 空闲 0.98 元）')
+
+// ---- 10. 回退与零回归（0.6.0）：缺失字段按未命中计费 + 连续回退提示 + 未启用零回归 ----
+console.log(`\n[${++step}] 回退与零回归（缺失字段按未命中计费 / 连续 5 次提示 / 未启用时输出与 0.5.0 一致）`)
+// 10.1 未启用 cache：apply 输出不含 cache 段，摘要无缓存行（零回归）
+const zctx = new Context()
+const ztools = []
+zctx.tools = { register: (def) => ztools.push(def) }
+apply(zctx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {
+    'deepseek-chat': { inputPerMillion: 2, cacheReadPerMillion: 0.5, outputPerMillion: 8 },
+  },
+  budgets: { total: { limit: 100 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+  verbose: false,
+})
+zctx.emit(
+  'session/event',
+  { get id() { return 'smoke-zero' } },
+  { type: 'assistant/message', time: Date.now(), data: { usage: { inputTokens: 100_000, outputTokens: 10_000 } } },
+)
+const zst = zctx.costGuard.status()
+assert.equal(zst.cache, undefined, 'cache.enabled 默认 false：状态无 cache 段（零回归）')
+const zsummary = zctx.costGuard.summary()
+assert.ok(!zsummary.includes('缓存:'), '摘要不含缓存行（零回归）')
+assert.ok(!zsummary.includes('前缀'), '摘要不含前缀提示（零回归）')
+// 既有计量不受影响：100k in + 10k out → 2M 输入价 + 8M 输出价 → 0.2 + 0.08 = 0.28 元
+assert.equal(zst.total.cost, 0.28, '未启用时既有话费计量与 0.5.0 一致')
+ok('10.1 未启用 cache：输出与 0.5.0 完全一致（无 cache 段 / 无缓存行 / 既有计量不变）')
+
+// 10.2 连续 5 次回退 → 一次性提示回调（每 10 分钟限一条）
+const rctx = new Context()
+const rmetrics = new CacheMetrics()
+const rengine = new CachePricingEngine()
+const rhint = new CacheHintDetector(rengine)
+let fallbackStreakFired = 0
+attachCacheMeter(rctx, {
+  tzOffsetMin: 480,
+  pricing: rengine,
+  metrics: rmetrics,
+  hint: rhint,
+  onFallbackStreak: (n) => {
+    fallbackStreakFired = n
+  },
+})
+for (let i = 0; i < 5; i++) {
+  rctx.emit(
+    'session/event',
+    { get id() { return `smoke-fb-${i}` } },
+    { type: 'assistant/message', time: Date.now(), data: { usage: { inputTokens: 100_000, outputTokens: 10_000 } } },
+  )
+}
+assert.equal(fallbackStreakFired, 5, '连续 5 次缺失缓存字段 → 一次性提示回调')
+const rs = rmetrics.summary('global')
+assert.equal(rs.uncertainCount, 5, '5 次缺失全部按未命中计费并计不确定')
+assert.equal(rs.inputTotal, 0, '不确定请求不污染可信命中率口径')
+ok('10.2 连续 5 次回退：一次性提示 + 全部按未命中计费 + uncertainCount=5 且不污染命中率')
+
 console.log(`\n[${++step}] 冒烟通过 ✓`)
-console.log('dsh-cost-guard@0.5.0 lib 产物在真实 Node 环境运行正常（实时计量 + 峰谷计费 + 预测式治理 + 自适应调节 + 效率洞察）')
+console.log('dsh-cost-guard@0.6.0 lib 产物在真实 Node 环境运行正常（实时计量 + 峰谷计费 + 预测式治理 + 自适应调节 + 效率洞察 + 缓存维度计量）')

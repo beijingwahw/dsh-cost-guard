@@ -25,11 +25,16 @@ import { buildPricingTable } from './core/pricing.js'
 import { DEFAULT_TZ_OFFSET_MIN } from './core/clock.js'
 import { CostTrail } from './core/trail.js'
 import { MadDetector } from './core/anomaly.js'
+import { CachePricingEngine } from './core/cache-pricing.js'
+import { CacheMetrics } from './core/cache-metrics.js'
+import { CacheHintDetector, DEFAULT_HINT_CONFIG } from './core/cache-hint.js'
+import type { PricingSource } from './core/cache-types.js'
 import { attachMeters } from './harness/listener.js'
 import { attachGuard, budgetInputFromMeter, type GuardHandle, type GuardMode } from './harness/guard.js'
 import { attachCostTool, buildCostStatus, formatStatusSummary } from './harness/tool.js'
 import { buildForecastContext, preStepEstimate, sampleEntry, type PredictiveRuntime } from './harness/predictive.js'
 import { buildGovernorInput, governorConfigFromAdaptive, type AdaptiveConfig } from './harness/adaptive.js'
+import { attachCacheMeter } from './harness/cache.js'
 
 export const name = 'cost-guard'
 
@@ -109,6 +114,22 @@ export interface CostGuardConfig {
   }
   /** 自适应调节（0.5.0，可选）：月度→日额度动态派生 + 消费速率背压 + 跨周期结转。 */
   adaptive?: AdaptiveConfig
+  /**
+   * 缓存维度计量（0.6.0，可选）：三通道 × 峰谷定价、命中率 / 收益 / 前缀提示。
+   * 默认关闭（enabled=false）——未配置或 disabled 时行为与 0.5.0 完全一致（零回归）。
+   */
+  cache?: {
+    /** 是否启用缓存维度计量（默认 false）。 */
+    enabled: boolean
+    /** 三通道价格覆盖：路由级（'provider/model' 或裸 'model'）> 全局。 */
+    priceOverride?: PricingSource
+    /** 可优化前缀提示阈值。 */
+    hint?: { minRepeat?: number; minSaving?: number }
+    /**
+     * 解析失败策略（当前固定为 'treat-as-miss'：按未命中计费并标注不确定；
+     * 保留字段以隔离未来策略演进）。 */
+    onParseFailure?: 'treat-as-miss'
+  }
 }
 
 export const Config = Schema.intersect([
@@ -188,6 +209,42 @@ export const Config = Schema.intersect([
         monthLimit: Schema.number().min(0),
       }),
     ]),
+    cache: Schema.object({
+      enabled: Schema.boolean().default(false),
+      priceOverride: Schema.object({
+        byRoute: Schema.dict(
+          Schema.object({
+            idle: Schema.object({
+              inputHit: Schema.number().min(0).required(),
+              inputMiss: Schema.number().min(0).required(),
+              output: Schema.number().min(0).required(),
+            }),
+            peak: Schema.object({
+              inputHit: Schema.number().min(0).required(),
+              inputMiss: Schema.number().min(0).required(),
+              output: Schema.number().min(0).required(),
+            }),
+          }),
+        ),
+        global: Schema.object({
+          idle: Schema.object({
+            inputHit: Schema.number().min(0).required(),
+            inputMiss: Schema.number().min(0).required(),
+            output: Schema.number().min(0).required(),
+          }),
+          peak: Schema.object({
+            inputHit: Schema.number().min(0).required(),
+            inputMiss: Schema.number().min(0).required(),
+            output: Schema.number().min(0).required(),
+          }),
+        }),
+      }),
+      hint: Schema.object({
+        minRepeat: Schema.number().min(1).default(DEFAULT_HINT_CONFIG.minRepeat),
+        minSaving: Schema.number().min(0).default(DEFAULT_HINT_CONFIG.minSaving),
+      }),
+      onParseFailure: Schema.union(['treat-as-miss'] as const).default('treat-as-miss'),
+    }),
   }),
 ])
 
@@ -257,6 +314,27 @@ export function apply(ctx: Context, config: CostGuardConfig) {
     },
   })
 
+  // 2.5) 缓存维度计量（0.6.0；默认关闭零回归）
+  const cacheEnabled = config.cache?.enabled === true
+  const cachePricing = cacheEnabled ? new CachePricingEngine(config.cache?.priceOverride ?? {}) : undefined
+  const statsCache: { metrics: CacheMetrics; hint: CacheHintDetector } | undefined = cacheEnabled
+    ? {
+        metrics: new CacheMetrics(),
+        hint: new CacheHintDetector(cachePricing!, {
+          minRepeat: config.cache?.hint?.minRepeat ?? DEFAULT_HINT_CONFIG.minRepeat,
+          minSaving: config.cache?.hint?.minSaving ?? DEFAULT_HINT_CONFIG.minSaving,
+        }),
+      }
+    : undefined
+  if (cacheEnabled && cachePricing && statsCache) {
+    attachCacheMeter(ctx, {
+      tzOffsetMin: config.tzOffsetMin,
+      pricing: cachePricing,
+      metrics: statsCache.metrics,
+      hint: statsCache.hint,
+    })
+  }
+
   // 3) 成本工具（含峰谷实时追踪 + 预测式治理展示 + 自适应与效率洞察）
   if (config.enableTool) {
     attachCostTool(ctx, meter, windows, evaluator, guard, {
@@ -265,17 +343,19 @@ export function apply(ctx: Context, config: CostGuardConfig) {
       tzOffsetMin: config.tzOffsetMin,
       predictive: { trail, detector },
       costSamples: detector,
+      cache: statsCache,
     })
   }
 
   // 4) 启动摘要
   const predictiveCfg = config.predictive
   logger.info(
-    '[cost-guard] 已启用：实时计量 + 峰谷计费(%s) + 预算熔断 (mode=%s)%s%s',
+    '[cost-guard] 已启用：实时计量 + 峰谷计费(%s) + 预算熔断 (mode=%s)%s%s%s',
     bands.length > 0 ? `${bands.length} 个时段` : '未配置',
     config.mode,
     predictiveCfg ? ' + 预测式治理' : '',
     governorCfg ? ' + 自适应调节' : '',
+    cacheEnabled ? ' + 缓存维度计量' : '',
   )
 
   // 暴露运行时状态供其他插件 / 面板读取
@@ -285,6 +365,7 @@ export function apply(ctx: Context, config: CostGuardConfig) {
     tzOffsetMin: config.tzOffsetMin,
     predictive: { trail, detector },
     costSamples: detector,
+    cache: statsCache,
   })
   ctx.provide('costGuard', {
     meter,

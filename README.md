@@ -7,6 +7,8 @@
 > 0.4.0 把「事后治理」升级为**预测式治理（Predictive Governance）**：不止看"现在花了多少"，而是回答"**今天/本月会花多少、预算何时耗完、这一发请求会不会烧穿、你是不是遇到了成本尖峰**"——在超支发生之前拦截，而非之后追责。
 >
 > 0.5.0 再进一步 —— **自适应调节（Adaptive Governance）**：把预算从「静态配额」升级为「会自我调节的额度」。它是成本治理类插件中首个把**月度→日额度动态派生、消费速率背压动态水位、跨周期结转**与预算决策闭环打通的产品级实现：花得快就自动收紧今天的额度、花得稳就留给你更多空间，上个月省下来的变成下个月可用的池子；同时新增**成本效率洞察（Cost Efficiency Intelligence）**，回答"花得值不值"——每千输出 token 成本、单请求成本分布（P50/P95/Max 长尾识别）与路由替代节约估算，把省钱建议直接给出。
+>
+> 0.6.0 补齐成本治理最大的结构性杠杆 —— **缓存维度计量（Cache Metering）**：DeepSeek 三通道计费下，缓存命中与未命中价差高达 30–50 倍（flash 空闲 0.02 元 vs 1.00 元/百万 Token），而此前所有输入都按未命中价计费。0.6.0 精确解析每次请求的缓存命中 Token，按 **三通道（命中/未命中/输出）× 高峰/空闲** 官方口径定价，输出 **Token 加权命中率、缓存收益金额（相对全未命中基线）与可优化前缀提示**——回答"优化前缀还能省多少钱"；默认关闭、未启用时行为与 0.5.0 完全一致。
 
 ---
 
@@ -26,6 +28,7 @@ DeepSeek Harness（DSH）是官方开源的 Agent Harness（"一切皆插件"，
 | **异常感知** | 月结才发现 | **MAD 成本尖峰检测**：稳健离群识别，尖峰请求即刻分级告警/熔断 |
 | **预算僵化** | 月初猛花月底干瞪眼 / 限死冗余 | **自适应调节**：月→日额度动态派生 + 消费速率背压 + 跨周期结转 |
 | **效率盲区** | 只知花了多少，不知花得值不值 | **效率洞察**：每千输出 token 成本、请求成本分布、路由替代节约建议 |
+| **缓存盲区** | 全部输入按未命中价计费，高估成本 | **缓存维度计量**：三通道×峰谷定价、Token 加权命中率、缓存收益、可优化前缀提示 |
 
 实时计量的关键是 DSH 的事件闭环：`session/event`（`assistant/message.usage` + `request/header.config`）提供**逐次调用的精确 token 用量与路由**；`agent/pre-step`（waterfall）提供**阻止下一步模型请求**的唯一干净位置。本插件把这两者接成一条防护链，并叠加预测引擎与自适应调节器构成「事后 + 事前 + 动态」三层治理。
 
@@ -49,6 +52,12 @@ DeepSeek Harness（DSH）是官方开源的 Agent Harness（"一切皆插件"，
   - **每千输出 token 成本**：输出是推理质量的主要载体，按路由给出「每千输出 token 花了多少」，识别"贵在哪儿"。
   - **单请求成本分布**：以单次请求成本样本（窗口内）计算 **P50 / P95 / Max / Avg**，揪出拖垮预算的长尾请求。
   - **路由替代节约估算**：用当前路由的累计用量（input+output token）按更便宜路由的单价重算，给出可执行的「换用 X 预计可省 Y 元（约 Z%）」建议。
+- **缓存维度计量（0.6.0 新增，默认关闭，零回归）**：
+  - **三通道 × 峰谷定价**：解析每次请求的缓存命中 Token（`prompt_tokens_details.cached_tokens`），按「输入-命中 / 输入-未命中 / 输出」三通道 × 官方高峰/空闲时段精确计价；价格获取顺序为「路由级覆盖 > 全局覆盖 > 内置官方表（DeepSeek 2026-09-10 生效价，flash / v4-pro，高峰为空闲 2 倍）」。高峰 = 北京时间周一至周五（非法定节假日）9:00-12:00 与 14:00-18:00，跨午夜按请求发起时刻归属。
+  - **Token 加权命中率**：按会话 / 路由 / 全局三级汇总输入 Token 缓存命中比例（命中 Token ÷ 输入 Token 总数，不用简单平均）。
+  - **缓存收益金额**：相对「全部输入按未命中价计费」基线，缓存命中带来的实际节省（`saving = baselineCost - cost`）。
+  - **可优化前缀提示**：识别高频重复且未命中占比高的输入前缀（`minRepeat`=3、`minSaving`=0.50 元默认），输出「前缀 X 近 N 次均未命中，若稳定化可节省约 Y 元」，只提示、不自动改写 Prompt。
+  - **失败回退与不确定度**：缓存命中字段缺失 / 异常时，按未命中计费并标注 `uncertainty: cached-unknown`（或 `malformed`），命中率不纳入可信汇总、单独计入不确定请求数；连续 5 次回退输出一次性提示（升级 DSH 或检查网关）。
 - **成本面板**：注册只读工具 `cost_guard_status`（模型可调用）与 `CostGuardService`（`ctx.costGuard`，其他插件可注入），并暴露人读摘要。0.4.0 起工具/摘要新增 `forecast` 段（今日/月末投影、置信区间、尖峰级别、预测式触发明细）；0.5.0 起新增 `adaptive` 段（动态额度/剩余/背压/动态水位/结转/cue）与 `efficiency` 段（每千输出成本、请求分布、替代节约建议）。
 - **价格覆盖**：内置 DeepSeek 官方价（`deepseek-chat` / `deepseek-reasoner`），支持按 `provider/model` 或裸 `model` 覆盖，未识别路由走保守兜底价。
 - **安全默认**：默认 `mode=block` 硬熔断 + `cancelOnBlock=true`；想纯观察可 `mode=off`（只计量不干预）。预测式治理与自适应调节默认不配置 = 行为与 0.3.0 完全一致。
@@ -119,6 +128,20 @@ plugins:
       backpressure: 0.5
       floorRatio: 0.3
       carryOverRatio: 1
+    # 缓存维度计量（0.6.0，可选；不配置或 enabled: false 则行为与 0.5.0 完全一致）
+    # - 三通道价格覆盖：可按路由（'provider/model' 或裸 'model'）或全局配置
+    #   idle/peak 两档的 { inputHit, inputMiss, output }（元/百万 token）；
+    #   未覆盖的路由/字段回退内置官方表（flash / v4-pro，2026-09-10 生效价）
+    # - hint：可优化前缀提示阈值（同一前缀重复 >= minRepeat 且潜在节省 >= minSaving 才提示）
+    # - onParseFailure：解析失败固定按未命中计费并标注不确定（保留字段供策略演进）
+    cache:
+      enabled: false          # 默认关闭；置 true 启用缓存维度计量
+      priceOverride:
+        global:
+          idle:  { inputHit: 0.02, inputMiss: 1.00, output: 4.00 }
+          peak:  { inputHit: 0.04, inputMiss: 2.00, output: 8.00 }
+      hint: { minRepeat: 3, minSaving: 0.50 }
+      onParseFailure: treat-as-miss
     fallbackProvider: deepseek
     fallbackModel: deepseek-chat
     enableTool: true
@@ -140,6 +163,7 @@ plugins:
 | `verbose` | boolean | `true` | 启动摘要日志 |
 | `predictive` | object | 未配置 | 预测式治理（0.4.0，可选）：`projections`（到期投影阈值）、`spike`（尖峰防护）、`preflight`（请求级预检）、`adaptive`（0.5.0：`{ scope, onExhausted }`）；不配置则与 0.3.0 行为一致 |
 | `adaptive` | object | 未配置 | 自适应调节（0.5.0，可选）：`monthLimit`（缺省回退 `budgets.month.limit`）、`reserveRatio`（默认 0.1）、`backpressure`（默认 0.5）、`floorRatio`（默认 0.3）、`carryOverRatio`（默认 1）；不配置则与 0.4.0 行为一致 |
+| `cache` | object | 未配置 | 缓存维度计量（0.6.0，可选）：`enabled`（默认 false）、`priceOverride`（三通道价格覆盖：`{ route? }.{ idle|peak }.{ inputHit|inputMiss|output }`，覆盖 > 全局 > 内置官方表）、`hint`（`minRepeat` 默认 3 / `minSaving` 默认 0.50）、`onParseFailure`（固定 `treat-as-miss`）；不配置则与 0.5.0 行为一致 |
 
 ## 使用效果
 
@@ -159,6 +183,11 @@ plugins:
   - `cost_guard_status` 返回结构新增 `adaptive` 段：`scope` / `dayAllowance`（今日动态额度）/ `dayRemaining` / `pressure`（背压因子）/ `warnAt` / `hardAt`（动态水位）/ `projectedMonthRemaining` / `carryOver`（下月结转）/ `exhausted` / `cue`（calm/frugal/minimal）；
   - 动态水位实际参与决策：背压越强，day 预算的告警/阻断越早触发；今日额度耗尽时按 `onExhausted` 告警或熔断本周期。
 - 成本效率洞察（0.5.0）：摘要新增效率行，如 `效率: 每千输出 token 成本最高 deepseek-reasoner 16.000 元（输出是质量杠杆）`、`分布: 单次请求成本 P50 1.00 · P95 8.00 · Max 30.00（5 次）` 与 `将 deepseek-reasoner 的用量切换到 deepseek-chat，预计可省 5.00 元（约 50%）`；`cost_guard_status` 返回结构新增 `efficiency` 段：`routes`（各路由每千输出成本与每百万 token 成本）/ `distribution`（P50/P95/Max/Avg）/ `replacement`（替代节约建议）。
+- 缓存维度计量（0.6.0）：配置 `cache.enabled: true` 后——
+  - 摘要新增缓存行：`缓存: 命中率 80.0% (8000000/10000000 tokens) · 收益 7.84 元`（存在不确定请求时追加 `· 不确定 N 次`）；
+  - 摘要新增前缀提示行：`提示: 前缀 deepseek/deepseek-chat#k23 近 5 次均未命中，若稳定化可节省约 1.20 元（当前命中率 0.0%）`；
+  - 缓存命中字段缺失时按未命中计费并标注不确定，连续 5 次回退输出 `[cost-guard] 连续 5 次请求缺少缓存命中字段...` 一次性提示；
+  - `cost_guard_status` 返回结构新增 `cache` 段：`summary`（全局 Token 加权命中率/收益/不确定数）、`sessions` 与 `routes`（会话/路由维度汇总）、`hints`（可优化前缀候选）。
 
 ## 架构
 
@@ -177,18 +206,24 @@ src/
     anomaly.ts   异常检测（滑动窗口 MAD 尖峰分级 + 请求级成本预检估算）
     governor.ts  自适应预算调节器（月→日额度派生 + 消费速率背压动态水位 + 跨周期结转）
     efficiency.ts 成本效率洞察（每千输出 token 成本 + 请求分布 P50/P95/Max + 路由替代节约估算）
+    cache-types.ts   缓存维度领域类型（TokenSplit / CacheLedgerRow / CacheSummary / PrefixCandidate）+ 端口（CacheUsageReader / CachePricingProvider / CacheLedgerStore）
+    cache-parse.ts   缓存用量解析器（cached_tokens 校验 + 缺失/异常回退标注，ParseOutcome 判别）
+    cache-pricing.ts 三通道 × 峰谷定价引擎（路由覆盖 > 全局 > 内置官方表；官方高峰判定 = 北京时间周一~周五非法定节假日 9-12/14-18 点）
+    cache-metrics.ts 缓存账本（Token 加权命中率 / 收益金额 / 不确定请求数，全局+会话+路由三级）
+    cache-hint.ts    可优化前缀提示检测器（签名归并、minRepeat/minSaving 阈值、潜在节省估算）
     budget.ts    预算决策引擎（纯函数；0.4.0 预测式策略 projection/spike/preflight；0.5.0 自适应 adaptive 策略）
     store.ts     快照持久化契约
   harness/     # 薄适配层（唯一接触 DSH API 的地方）
     listener.ts   session/event → UsageEntry（实时计量，按事件时刻选带）+ 轨迹/尖峰采样
     predictive.ts 预测上下文装配（buildForecastContext / preStepEstimate / sampleEntry）
     adaptive.ts   自适应调节装配（governorConfigFromAdaptive / buildGovernorInput）
+    cache.ts      缓存计量适配（DshCacheUsageReader：响应 usage → 原始快照；attachCacheMeter：事件驱动 core 账本 + 回退告警；CachePanelPresenter：面板/洞察/提示输出）
     guard.ts      agent/pre-step → reject/cancel（熔断）+ 请求级预检 + 预测式触发达告警 + 自适应输入注入
-    tool.ts       cost_guard_status 工具 + 人读摘要（当前时段/生效单价/分带分布/预测尖峰/自适应/效率洞察）
+    tool.ts       cost_guard_status 工具 + 人读摘要（当前时段/生效单价/分带分布/预测尖峰/自适应/效率/缓存）
   index.ts      插件装配（Config / apply）
   service.ts    CostGuardService 契约（inject 给其他插件）
-tests/         单元测试（vitest，128 用例）
-scripts/smoke.mjs  冒烟测试（真实 lib 产物 + 真实 cordis Context，9 节）
+tests/         单元测试（vitest，165 用例）
+scripts/smoke.mjs  冒烟测试（真实 lib 产物 + 真实 cordis Context，11 节）
 ```
 
 数据流：
@@ -224,9 +259,10 @@ npm pack           # 发布包预检
 
 - 新增价格口径：改 `core/pricing.ts` 的 `BUILTIN_PRICES`，规则为"用户配置优先、内置兜底"。
 - 新增峰谷时段：在配置 `bands` 中加 `{ id, start, end, prices }`，`pricing.ts` 的 `bandIdForEpoch` 负责选带、`priceForAt` 负责带内覆盖与回退（core 内已含 `inBand`/跨午夜/全天解析与单测）。
+- 新增缓存计费口径：改 `core/cache-pricing.ts` 的 `BUILTIN_CACHE_PRICES`（三通道价），规则为"路由覆盖 > 全局覆盖 > 内置兜底"；官方高峰判定在 `deepseekBandForEpoch`（可注入节假日表）。
 - 新增预算维度：扩展 `core/types.ts` 的 `BudgetScope`，并在 `budget.ts` 的 `policiesFromConfig` 注册顺序。
 - 新增预测策略：`core/budget.ts` 的 `PredictivePolicy` 是纯声明（projection/spike/preflight），决策逻辑为纯函数，直接加单测；harness 侧只需在 `harness/predictive.ts` 提供对应的事实构造器（如新的投影目标时刻解析器）。
-- 新增事件消费：在 `harness/` 加适配器，领域逻辑放 `core/`，保持核心零 DSH 依赖。
+- 新增事件消费：在 `harness/` 加适配器（如 `harness/cache.ts` 的 `attachCacheMeter`），领域逻辑放 `core/`，保持核心零 DSH 依赖。
 - 持久化：`core/store.ts` 定义 `CostSnapshot` 形状（含 `bands` 分带分布）；接入 `ctx.costGuard` 服务即可跨重启恢复。
 
 ## 与现有方案对比
@@ -247,6 +283,14 @@ npm pack           # 发布包预检
 | 0.3.0 | 话费 + 积分双维度统计 |
 | 0.4.0 | 预测式治理（投影 / 预检 / 尖峰），单测 56→104，冒烟 7→8 节 |
 | **0.5.0** | **自适应调节（月→日额度派生 / 背压水位 / 跨周期结转）+ 成本效率洞察（每千输出成本 / 请求分布 / 替代节约建议），单测 104→128，冒烟 8→9 节** |
+| **0.6.0** | **缓存维度计量（三通道×峰谷定价 / Token 加权命中率 / 缓存收益 / 可优化前缀提示 / 失败回退标注），单测 128→165，冒烟 9→11 节** |
+
+0.6.0 的行业增量点（全部遵循六边形架构，core 层零 DSH 依赖，默认关闭、未配置时与 0.5.0 完全一致）：
+
+1. **把成本算对，而不是算保守**：此前所有输入按未命中价计费，系统性高估成本（flash 价差 50 倍、v4-pro 30 倍）。0.6.0 按官方三通道口径核算，成本与账单对齐，同时首次量化出"缓存到底帮你省了多少钱"——这是成本治理类插件中首个**缓存维度计量**产品级实现。
+2. **命中率按 Token 加权，而不是简单平均**：会话/路由/全局三级汇总均以命中 Token ÷ 输入 Token 计算，数据量大的请求权重更高，指标不被小请求稀释。
+3. **可执行的前缀优化提示，而非"请优化"**：识别高频重复且未命中占比高的前缀，直接给出"若稳定化可节省约 Y 元"，把 50 倍价差变成可执行的省钱动作（只提示、不代改，避免破坏性自动化）。
+4. **失败可归因、不脏数据**：缓存字段缺失/异常时按保守口径计费并标注不确定度，命中率统计天然隔离不可信样本，连续 5 次回退还给出升级/排查提示——保证指标可信、可审计。
 
 0.5.0 的行业增量点（全部在 core 层零 DSH 依赖实现，默认关闭、未配置时与 0.4.0 语义完全一致）：
 
