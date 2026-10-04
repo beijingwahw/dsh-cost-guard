@@ -1,6 +1,6 @@
 {
   "name": "dsh-cost-guard",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "DeepSeek Harness 原生实时成本治理插件：实时计量、多维预算、熔断防护、成本面板。",
   "type": "module",
   "license": "MIT",
