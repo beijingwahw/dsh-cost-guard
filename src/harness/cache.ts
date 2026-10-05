@@ -49,29 +49,29 @@ export function readCacheUsage(event: unknown): CacheUsageResult {
   if (!data || typeof data !== 'object') return { status: 'missing', raw: null }
   const inner = data as Record<string, unknown>
   // 部分宿主把 usage 放在 data.usage；兼容 response.usage 形状
-  const usage = (inner.usage ?? inner.response) as Record<string, unknown> | null | undefined
+  const usage = (inner['usage'] ?? inner['response']) as Record<string, unknown> | null | undefined
   if (!usage || typeof usage !== 'object') return { status: 'missing', raw: null }
 
   // 输入 token：prompt_tokens（原生）> promptTokens > inputTokens(+cacheRead)
-  let promptTokens = num(usage.prompt_tokens) ?? num(usage.promptTokens)
+  let promptTokens = num(usage['prompt_tokens']) ?? num(usage['promptTokens'])
   if (promptTokens === undefined) {
-    const input = num(usage.inputTokens) ?? 0
-    const cacheRead = num(usage.cacheReadTokens) ?? 0
+    const input = num(usage['inputTokens']) ?? 0
+    const cacheRead = num(usage['cacheReadTokens']) ?? 0
     promptTokens = input + cacheRead
   }
-  const completionTokens = num(usage.completion_tokens) ?? num(usage.completionTokens) ?? num(usage.outputTokens) ?? 0
+  const completionTokens = num(usage['completion_tokens']) ?? num(usage['completionTokens']) ?? num(usage['outputTokens']) ?? 0
 
   // 缓存命中 token：prompt_tokens_details.cached_tokens（原生）> cachedTokens > cacheReadTokens
   // 字段"存在但非法"（负数/非整数/超限）用哨兵 -1 传递，由 core 解析器判为 malformed。
-  const details = usage.prompt_tokens_details as Record<string, unknown> | undefined
+  const details = usage['prompt_tokens_details'] as Record<string, unknown> | undefined
   let cachedRaw: unknown
   if (details && typeof details === 'object' && 'cached_tokens' in details) {
-    cachedRaw = details.cached_tokens
-  } else if (usage.cachedTokens !== undefined) {
-    cachedRaw = usage.cachedTokens
+    cachedRaw = details['cached_tokens']
+  } else if (usage['cachedTokens'] !== undefined) {
+    cachedRaw = usage['cachedTokens']
   } else if ('cacheReadTokens' in usage) {
     // DSH 归一化字段存在即视为明确（含 0 = 确无命中）；字段不存在视为缺失 -> 回退
-    cachedRaw = usage.cacheReadTokens
+    cachedRaw = usage['cacheReadTokens']
   }
   const cachedTokens = cachedRaw === undefined ? undefined : (num(cachedRaw) ?? -1)
 
@@ -128,53 +128,59 @@ export function attachCacheMeter(ctx: Context, options: CacheMeterOptions): void
   let currentRoute = 'deepseek/deepseek-chat'
 
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
-    if (event.type === 'request/header') {
-      const parsed: ParsedSessionEvent = parseSessionEvent(event)
-      if (parsed.provider || parsed.model) {
-        currentRoute = `${parsed.provider ?? 'deepseek'}/${parsed.model ?? 'deepseek-chat'}`
-      }
-      return
-    }
-    if (event.type !== 'assistant/message') return
-    // 以 readCacheUsage 自身为准：兼容 OpenAI 原生（prompt_tokens*）与 DSH 归一化形状
-    const result = readCacheUsage({ ...event, data: (event as { data?: unknown }).data })
-    if (result.status !== 'ok') return // 用量整体缺失：不入账（与既有计量一致）
-    const raw = result.raw
-    const parsed: ParsedSessionEvent = parseSessionEvent({ ...event, sessionId: String(session.id) })
-    const time = parsed.time
-    const routeKey = currentRoute
-
-    const outcome = parseCachedUsage(raw)
-    const split = outcomeToSplit(outcome, raw.completionTokens ?? parsed.usage?.outputTokens ?? 0)
-
-    const band = deepseekBandForEpoch(time, tzOffsetMin)
-    const price = pricing.resolve(routeKey, band)
-    const { cost, baselineCost, saving } = computeCacheCost(split, price)
-
-    metrics.append({ split, cost, baselineCost, saving }, {
-      sessionId: parsed.sessionId,
-      route: routeKey,
-    })
-
-    const prefixId = prefixOf(routeKey, { inputHit: split.inputHit, inputMiss: split.inputMiss })
-    hint.observe(prefixId, routeKey, split, time, tzOffsetMin)
-
-    // 连续 5 次回退：一次性提示，最多每 10 分钟一条
-    if (split.uncertainty) {
-      fallbackStreak += 1
-      if (fallbackStreak === 5) {
-        const now = Date.now()
-        if (now - lastFallbackHintAt >= 600_000) {
-          lastFallbackHintAt = now
-          logger.warn(
-            '[cost-guard] 连续 5 次请求缺少缓存命中字段（cached_tokens），已按未命中计费并标注不确定。' +
-              '建议升级 DSH 版本或检查网关是否剥离 usage 扩展字段。',
-          )
-          options.onFallbackStreak?.(fallbackStreak)
+    try {
+      if (event.type === 'request/header') {
+        const parsed: ParsedSessionEvent = parseSessionEvent(event)
+        if (parsed.provider || parsed.model) {
+          currentRoute = `${parsed.provider ?? 'deepseek'}/${parsed.model ?? 'deepseek-chat'}`
         }
+        return
       }
-    } else {
-      fallbackStreak = 0
+      if (event.type !== 'assistant/message') return
+      // 以 readCacheUsage 自身为准：兼容 OpenAI 原生（prompt_tokens*）与 DSH 归一化形状
+      const result = readCacheUsage({ ...event, data: (event as { data?: unknown }).data })
+      if (result.status !== 'ok') return // 用量整体缺失：不入账（与既有计量一致）
+      const raw = result.raw
+      const parsed: ParsedSessionEvent = parseSessionEvent({ ...event, sessionId: String(session.id) })
+      const time = parsed.time
+      const routeKey = currentRoute
+
+      const outcome = parseCachedUsage(raw)
+      const split = outcomeToSplit(outcome, raw.completionTokens ?? parsed.usage?.outputTokens ?? 0)
+
+      const band = deepseekBandForEpoch(time, tzOffsetMin)
+      const price = pricing.resolve(routeKey, band)
+      const { cost, baselineCost, saving } = computeCacheCost(split, price)
+
+      metrics.append({ split, cost, baselineCost, saving }, {
+        ...(parsed.sessionId !== undefined ? { sessionId: parsed.sessionId } : {}),
+        route: routeKey,
+      })
+
+      const prefixId = prefixOf(routeKey, { inputHit: split.inputHit, inputMiss: split.inputMiss })
+      hint.observe(prefixId, routeKey, split, time, tzOffsetMin)
+
+      // 连续 5 次回退：一次性提示，最多每 10 分钟一条
+      if (split.uncertainty) {
+        fallbackStreak += 1
+        if (fallbackStreak === 5) {
+          const now = Date.now()
+          if (now - lastFallbackHintAt >= 600_000) {
+            lastFallbackHintAt = now
+            logger.warn(
+              '[cost-guard] 连续 5 次请求缺少缓存命中字段（cached_tokens），已按未命中计费并标注不确定。' +
+                '建议升级 DSH 版本或检查网关是否剥离 usage 扩展字段。',
+            )
+            options.onFallbackStreak?.(fallbackStreak)
+          }
+        }
+      } else {
+        fallbackStreak = 0
+      }
+    } catch (err) {
+      // 缓存计量是旁路能力：单条事件解析/入账失败只跳过本条并留日志，
+      // 不得把异常抛回宿主事件链（fail-safe，不吞错）。
+      logger.warn(`[cost-guard] 缓存计量事件处理失败，已跳过：${err instanceof Error ? err.message : String(err)}`)
     }
   })
 }

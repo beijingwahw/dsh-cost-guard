@@ -16,6 +16,11 @@ import type { UsageBucket } from './types.js'
 import type { PricingTable } from './pricing.js'
 import { sortedAsc, percentile } from './math.js'
 
+/** Token 单位换算：每千 token。 */
+const TOKENS_PER_K = 1000
+/** Token 单位换算：每百万 token。 */
+const TOKENS_PER_M = 1_000_000
+
 /** 单请求成本分布统计。 */
 export interface RequestCostDistribution {
   /** 样本数。 */
@@ -70,11 +75,12 @@ export function requestCostDistribution(samples: number[]): RequestCostDistribut
   if (valid.length < 3) return undefined
   const sorted = sortedAsc(valid)
   const sum = valid.reduce((a, b) => a + b, 0)
+  const max = sorted[sorted.length - 1] ?? 0
   return {
     n: valid.length,
     p50: percentile(sorted, 50),
     p95: percentile(sorted, 95),
-    max: sorted[sorted.length - 1]!,
+    max,
     avg: sum / valid.length,
   }
 }
@@ -83,8 +89,8 @@ export function requestCostDistribution(samples: number[]): RequestCostDistribut
 export function routeEfficiency(routes: Record<string, UsageBucket>): RouteEfficiency[] {
   const out: RouteEfficiency[] = []
   for (const [route, b] of Object.entries(routes)) {
-    const costPerKOutput = b.outputTokens > 0 ? (b.cost * 1000) / b.outputTokens : 0
-    const costPerMTokens = b.totalTokens > 0 ? (b.cost * 1_000_000) / b.totalTokens : 0
+    const costPerKOutput = b.outputTokens > 0 ? (b.cost * TOKENS_PER_K) / b.outputTokens : 0
+    const costPerMTokens = b.totalTokens > 0 ? (b.cost * TOKENS_PER_M) / b.totalTokens : 0
     out.push({
       route,
       cost: b.cost,

@@ -77,8 +77,8 @@ export function buildGovernorInput(
     daySpent: runtime.windows.today().cost,
     daysLeftInMonth: daysLeftInMonth(now, runtime.tzOffsetMin),
     carriedIn: runtime.carriedIn ?? 0,
-    dayProjected: projected['day'],
-    monthProjected: projected['month'],
+    ...(projected['day'] !== undefined ? { dayProjected: projected['day'] } : {}),
+    ...(projected['month'] !== undefined ? { monthProjected: projected['month'] } : {}),
   })
   return { governor: input }
 }

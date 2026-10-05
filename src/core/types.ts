@@ -12,7 +12,12 @@ export interface TokenUsageLike {
   reasoningTokens?: number
 }
 
-/** 单模型价格（金额 / 每百万 token；币种由调用方说明，默认 CNY）。 */
+/**
+ * 单模型价格（金额 / 每百万 token；币种由注册表 / 调用方说明）：
+ * - DeepSeek 官方价目为 CNY；
+ * - OpenAI / Anthropic / Google / Mistral 官方价目为 USD；
+ * 插件按各厂商原币种计量，不做汇率换算（不虚构汇率）。
+ */
 export interface ModelPrice {
   /** 输入（缓存未命中）价格。 */
   inputPerMillion: number
@@ -20,6 +25,11 @@ export interface ModelPrice {
   cacheReadPerMillion: number
   /** 输出价格。 */
   outputPerMillion: number
+  /**
+   * 缓存写入价格（Anthropic 官方按写入 token 单独计价；其余厂商无写价概念）。
+   * 可选：未定义时缓存写入 token 不单独计价（保持既有三通道口径，零回归）。
+   */
+  cacheWritePerMillion?: number
   /** 积分单价（每百万 token 消耗的积分）。可选，未配置时该模型积分消耗按 0 计。 */
   creditsPerMillion?: number
 }

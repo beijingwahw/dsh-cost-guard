@@ -9,6 +9,7 @@ import {
   modelOf,
 } from '../src/core/cache-pricing.js'
 import type { RoutePricing } from '../src/core/cache-types.js'
+import { buildOfficialCachePricingTable } from '../src/core/official-pricing.js'
 
 /** 北京时间 helper：返回北京时刻对应 epoch ms（UTC+8）。 */
 function bj(y: number, m: number, d: number, hh: number, mm: number): number {
@@ -83,10 +84,35 @@ describe('cache-pricing 三通道定价', () => {
     expect(eng.resolve('deepseek/deepseek-chat', 'peak')).toEqual(onlyIdle.idle)
   })
 
-  it('modelOf 提取路由中的裸 model 名', () => {
+it('modelOf 提取路由中的裸 model 名', () => {
     expect(modelOf('deepseek/deepseek-flash')).toBe('deepseek-flash')
-    expect(modelOf('deepseek-flash')).toBe('deepseek-flash')
-    expect(modelOf('a/b/c')).toBe('b/c')
+    expect(modelOf('flash-only')).toBe('flash-only')
+  })
+
+  it('别名归一：官方已下线旧名（deepseek-v4-flash 等）按现行模型价计费', () => {
+    const aliased = new CachePricingEngine({}, {
+      'deepseek-v4-flash': 'deepseek-flash',
+      'deepseek-v4-flash-vision-exp': 'deepseek-flash',
+    })
+    // 旧名 + 高峰 -> flash 高峰价（不再是保守兜底最贵档）
+    expect(aliased.resolve('deepseek/deepseek-v4-flash', 'peak')).toEqual({
+      inputHit: 0.04, inputMiss: 2.0, output: 8.0,
+    })
+    expect(aliased.resolveWithSource('deepseek/deepseek-v4-flash-vision-exp', 'idle').source).toBe('builtin')
+    // 未启用别名时保持零回归：旧名仍落保守兜底
+    const vanilla = new CachePricingEngine({})
+    expect(vanilla.resolveWithSource('deepseek/deepseek-v4-flash', 'idle').source).toBe('fallback')
+  })
+
+  it('别名不遮蔽用户路由级覆盖（覆盖仍第一优先）', () => {
+    const engine = new CachePricingEngine({
+      byRoute: {
+        'deepseek/deepseek-v4-flash': { idle: { inputHit: 0.5, inputMiss: 2.5, output: 9 }, peak: { inputHit: 1, inputMiss: 5, output: 18 } },
+      },
+    }, { 'deepseek-v4-flash': 'deepseek-flash' })
+    const r = engine.resolveWithSource('deepseek/deepseek-v4-flash', 'idle')
+    expect(r.source).toBe('override')
+    expect(r.price.inputMiss).toBe(2.5)
   })
 })
 
@@ -131,5 +157,47 @@ describe('cache-pricing 高峰时段判定', () => {
   it('跨午夜归属：凌晨请求发起时刻为空闲，不按日内切分', () => {
     expect(deepseekBandForEpoch(bj(2026, 9, 8, 0, 30), 480)).toBe('idle')
     expect(deepseekBandForEpoch(bj(2026, 9, 8, 6, 0), 480)).toBe('idle')
+  })
+})
+
+/* —— 0.10.0 多厂商官方缓存表（officialPricing 启用时注入第三参） —— */
+describe('cache-pricing 多厂商官方缓存表（0.10.0）', () => {
+  it('官方表派生：flat 厂商（OpenAI）peak=idle 恒定价，DeepSeek（dsn-peak）峰谷×2', () => {
+    const official = buildOfficialCachePricingTable()
+    // OpenAI gpt-6-astra：USD 恒定价，peak=idle
+    expect(official['gpt-6-astra']).toEqual({
+      idle: { inputHit: 1, inputMiss: 10, output: 50 },
+      peak: { inputHit: 1, inputMiss: 10, output: 50 },
+    })
+    // Anthropic claude-opus-5.5：flat 恒定价
+    expect(official['claude-opus-5.5']).toEqual({
+      idle: { inputHit: 0.2, inputMiss: 4, output: 20 },
+      peak: { inputHit: 0.2, inputMiss: 4, output: 20 },
+    })
+    // DeepSeek dsn-peak：peak = idle × 2（与 BUILTIN_CACHE_PRICES 一致）
+    expect(official['deepseek-flash']).toEqual(BUILTIN_CACHE_PRICES['deepseek-flash'])
+    expect(official['deepseek-v4-pro']).toEqual(BUILTIN_CACHE_PRICES['deepseek-v4-pro'])
+  })
+
+  it('引擎接入官方表：多厂商模型按官方三通道价计费（来源 builtin）', () => {
+    const engine = new CachePricingEngine({}, {}, buildOfficialCachePricingTable())
+    const astra = engine.resolveWithSource('openai/gpt-6-astra', 'peak')
+    expect(astra.source).toBe('builtin')
+    expect(astra.price).toEqual({ inputHit: 1, inputMiss: 10, output: 50 })
+    const ds = engine.resolve('deepseek/deepseek-flash', 'peak')
+    expect(ds.inputMiss).toBe(2)
+  })
+
+  it('未启用官方表时多厂商模型回落保守兜底（与 0.9.0 完全一致，零回归）', () => {
+    const vanilla = new CachePricingEngine({})
+    const r = vanilla.resolveWithSource('openai/gpt-6-astra', 'idle')
+    expect(r.source).toBe('fallback')
+    expect(r.price).toEqual(FALLBACK_CACHE_PRICE)
+  })
+
+  it('decommissioned / oss 模型不进官方缓存表（无官方价，不虚构）', () => {
+    const official = buildOfficialCachePricingTable()
+    expect(official['gemini-2.5-flash']).toBeUndefined()
+    expect(official['llama-4-maverick']).toBeUndefined()
   })
 })

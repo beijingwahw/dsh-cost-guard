@@ -59,7 +59,7 @@ export class Meter {
   record(entry: UsageEntry, sessionId?: string): void {
     // 时间维度
     this.add(this.bucketOf('total'), entry)
-    this.add(this.bucketOf('day' as BudgetScope), entry)
+    this.add(this.bucketOf('day'), entry)
     if (sessionId) {
       this.add(this.bucketOf('session'), entry)
     }
@@ -99,7 +99,9 @@ export class Meter {
   snapshot(): MeterSnapshot {
     const buckets: Partial<Record<BudgetScope, UsageBucket>> = {}
     for (const [k, v] of Object.entries(this.buckets)) {
-      buckets[k as BudgetScope] = { ...v }
+      if (k === 'session' || k === 'day' || k === 'month' || k === 'total') {
+        buckets[k] = { ...v }
+      }
     }
     const routes: Record<string, UsageBucket> = {}
     for (const [k, v] of Object.entries(this.routes)) routes[k] = { ...v }

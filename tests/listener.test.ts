@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { parseSessionEvent, toUsageEntry } from '../src/harness/listener.js'
 import { buildPricingTable } from '../src/core/pricing.js'
+import { buildOfficialPricingTable } from '../src/core/official-pricing.js'
 
 function fakeEvent(type: string, data: unknown, time = 1_700_000_000_000) {
   return { type, data, time } as never
@@ -35,6 +36,19 @@ describe('listener.parseSessionEvent', () => {
   it('usage 缺失时宽容', () => {
     const e = parseSessionEvent(fakeEvent('assistant/message', {}))
     expect(e.usage).toBeUndefined()
+  })
+
+  it('assistant/message 宽容读取数据载荷中的路由（宿主随消息下发）', () => {
+    const e = parseSessionEvent(
+      fakeEvent('assistant/message', {
+        provider: 'deepseek',
+        model: 'deepseek-flash',
+        usage: { inputTokens: 10, outputTokens: 5 },
+      }),
+    )
+    expect(e.provider).toBe('deepseek')
+    expect(e.model).toBe('deepseek-flash')
+    expect(e.usage?.inputTokens).toBe(10)
   })
 
   it('未知事件类型不抛错', () => {
@@ -216,5 +230,145 @@ describe('listener.toUsageEntry', () => {
     )
     expect(en!.band).toBe('peak')
     expect(en!.cost).toBeCloseTo(4, 6) // reasoner 无带内价 -> 基准 4
+  })
+})
+
+describe('listener.toUsageEntry 官方计价模式（0.8.0）', () => {
+  const fb = { provider: 'deepseek', model: 'deepseek-chat' }
+  // 官方模式装配层的等价基准价表（内置价 + 官方 idle 价 + 用户覆盖）
+  const routes = buildOfficialPricingTable({})
+  const officialCtx = (enabled: boolean, overrides: Record<string, never> = {}, holidays?: ReadonlySet<string>) => ({
+    bands: [],
+    tzOffsetMin: 480,
+    official: { enabled, overrides, ...(holidays ? { holidays } : {}) },
+  })
+
+  it('官方未启用时保持 BASE_BAND（零回归）', () => {
+    const en = toUsageEntry(
+      {
+        type: 'assistant/message',
+        time: Date.UTC(2026, 8, 13, 2, 0, 0), // 周日 10:00 +08
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        usage: { inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0 },
+      },
+      routes,
+      fb,
+      officialCtx(false) as never,
+    )
+    expect(en!.band).toBe('base')
+    expect(en!.cost).toBeCloseTo(2, 6) // 旧内置价
+  })
+
+  it('官方模式工作日高峰自动挂载官方峰谷与官方价', () => {
+    const en = toUsageEntry(
+      {
+        type: 'assistant/message',
+        time: Date.UTC(2026, 8, 14, 2, 0, 0), // 周一 10:00 +08 peak
+        provider: 'deepseek',
+        model: 'deepseek-flash',
+        usage: { inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0 },
+      },
+      routes,
+      fb,
+      officialCtx(true) as never,
+    )
+    expect(en!.band).toBe('peak')
+    expect(en!.cost).toBeCloseTo(2, 6) // flash 高峰 input = 1 × 2
+  })
+
+  it('官方模式空闲时段按 idle 价', () => {
+    const en = toUsageEntry(
+      {
+        type: 'assistant/message',
+        time: Date.UTC(2026, 8, 14, 5, 0, 0), // 周一 13:00 +08 idle
+        provider: 'deepseek',
+        model: 'deepseek-flash',
+        usage: { inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0 },
+      },
+      routes,
+      fb,
+      officialCtx(true) as never,
+    )
+    expect(en!.band).toBe('idle')
+    expect(en!.cost).toBeCloseTo(1, 6)
+  })
+
+  it('官方模式法定节假日（国庆）全天按 idle', () => {
+    const en = toUsageEntry(
+      {
+        type: 'assistant/message',
+        time: Date.UTC(2026, 9, 5, 2, 0, 0), // 国庆 10:00 +08（法定假日）
+        provider: 'deepseek',
+        model: 'deepseek-flash',
+        usage: { inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0 },
+      },
+      routes,
+      fb,
+      officialCtx(true) as never,
+    )
+    expect(en!.band).toBe('idle')
+    expect(en!.cost).toBeCloseTo(1, 6)
+  })
+
+  it('官方模式旧模型名归一到现行模型价（不再落保守兜底）', () => {
+    const en = toUsageEntry(
+      {
+        type: 'assistant/message',
+        time: Date.UTC(2026, 8, 14, 5, 0, 0), // idle
+        provider: 'deepseek',
+        model: 'deepseek-v4-flash',
+        usage: { inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0 },
+      },
+      routes,
+      fb,
+      officialCtx(true) as never,
+    )
+    expect(en!.cost).toBeCloseTo(1, 6) // 按 flash idle 计
+  })
+
+  it('官方模式用户覆盖为最终单价，不随峰谷翻倍', () => {
+    const en = toUsageEntry(
+      {
+        type: 'assistant/message',
+        time: Date.UTC(2026, 8, 14, 2, 0, 0), // peak
+        provider: 'deepseek',
+        model: 'deepseek-flash',
+        usage: { inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0 },
+      },
+      routes,
+      fb,
+      {
+        bands: [],
+        tzOffsetMin: 480,
+        official: {
+          enabled: true,
+          overrides: { 'deepseek-flash': { inputPerMillion: 0.8, cacheReadPerMillion: 0.01, outputPerMillion: 3.2 } },
+        },
+      } as never,
+    )
+    expect(en!.band).toBe('peak')
+    expect(en!.cost).toBeCloseTo(0.8, 6) // 用户最终单价，不 ×2
+  })
+
+  it('官方模式但用户配置了自定义时段时仍以用户时段优先', () => {
+    const en = toUsageEntry(
+      {
+        type: 'assistant/message',
+        time: Date.UTC(2026, 8, 14, 2, 0, 0), // 官方 peak，但用户时段 18-22 不命中 -> base
+        provider: 'deepseek',
+        model: 'deepseek-flash',
+        usage: { inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0 },
+      },
+      routes,
+      fb,
+      {
+        bands: [{ id: 'evening', start: '18:00', end: '22:00' }] as never,
+        tzOffsetMin: 480,
+        official: { enabled: true, overrides: {} },
+      } as never,
+    )
+    expect(en!.band).toBe('base') // 未命中用户时段 → BASE_BAND + 官方基准价表
+    expect(en!.cost).toBeCloseTo(1, 6) // 官方价表已并入基准
   })
 })

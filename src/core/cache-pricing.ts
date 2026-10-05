@@ -1,16 +1,18 @@
 /**
- * @module dsh-cost-guard/core/cache-pricing
  * 三通道 × 峰谷定价引擎（CachePricingEngine，零 DSH 依赖）。
  *
- * 价格获取顺序（方案文档 5.1）：
+ * 价格获取顺序（方案文档 5.1 / 0.10.0 多厂商扩展）：
  *   1. 用户按路由、按时段的显式覆盖（覆盖 > 路由级缺失时回退全局）
  *   2. 用户全局三通道覆盖
- *   3. 内置官方价格表（DeepSeek 2026-09-10 生效价）
+ *   3. 官方多厂商缓存表（0.10.0：officialPricing 启用时由 index 注入，
+ *      由 OFFICIAL_MODEL_REGISTRY 派生：DeepSeek dsn-peak 峰谷×2、其余厂商 flat 恒定价；
+ *      缺省 undefined = 与 0.9.0 完全一致，零回归）
+ *   4. 内置官方价格表（DeepSeek 2026-09-10 生效价）
  *
  * 高峰时段（方案文档 2.2 / 5.2，北京时间）：
  *   周一至周五（非法定节假日）9:00-12:00 与 14:00-18:00；
  *   其余时间（含周末、法定节假日全天）为空闲时段。
- *   高峰价 = 空闲价 × 2。
+ *   仅 DeepSeek（dsn-peak 策略）高峰价 = 空闲价 × 2；多厂商（flat 策略）官方恒定价，peak = idle。
  *   跨午夜会话按请求发起时刻所在账期归属，不做请求内切分。
  *
  * 内置官方价（CNY / 1M token，2026-09-10 生效）：
@@ -64,6 +66,12 @@ export function modelOf(route: string): string {
   return idx >= 0 ? route.slice(idx + 1) : route
 }
 
+// 高峰时段（本地分钟，含起点不含终点）：[09:00, 12:00) 与 [14:00, 18:00)
+const PEAK_MORNING_START_MIN = 9 * 60
+const PEAK_MORNING_END_MIN = 12 * 60
+const PEAK_AFTERNOON_START_MIN = 14 * 60
+const PEAK_AFTERNOON_END_MIN = 18 * 60
+
 /**
  * 按事件时刻判定 DeepSeek 官方计费时段（本地时刻选带）。
  * 周一至周五且非法定节假日、本地分钟落在 [09:00,12:00) 或 [14:00,18:00) -> peak，否则 idle。
@@ -78,8 +86,10 @@ export function deepseekBandForEpoch(
   if (dow === 0 || dow === 6) return 'idle' // 周末
   if (holidays.has(dayKey(timeMs, tzOffsetMin))) return 'idle' // 法定节假日全天
   const minutes = (Math.floor((timeMs + tzOffsetMin * 60_000) / 60_000) % 1440 + 1440) % 1440
-  if ((minutes >= 540 && minutes < 720) || (minutes >= 840 && minutes < 1080)) return 'peak'
-  return 'idle'
+  const isPeak =
+    (minutes >= PEAK_MORNING_START_MIN && minutes < PEAK_MORNING_END_MIN) ||
+    (minutes >= PEAK_AFTERNOON_START_MIN && minutes < PEAK_AFTERNOON_END_MIN)
+  return isPeak ? 'peak' : 'idle'
 }
 
 /** 按本地时刻判定（接受 Date 或 epoch ms），供测试与预览使用。 */
@@ -92,12 +102,21 @@ export function deepseekBandAt(
   return deepseekBandForEpoch(ms, tzOffsetMin, holidays)
 }
 
-/** 三通道定价引擎：覆盖 > 全局 > 内置官方表。 */
+/** 三通道定价引擎：覆盖 > 全局 > 官方多厂商表 > 内置官方表（模型名经别名归一后再查内置表）。 */
 export class CachePricingEngine {
   private readonly source: PricingSource
+  private readonly aliases: Record<string, string>
+  /** 0.10.0：官方多厂商缓存表（officialPricing 启用时注入；缺省 = 0.9.0 行为，零回归）。 */
+  private readonly official: Record<string, RoutePricing>
 
-  constructor(source: PricingSource = {}) {
+  constructor(
+    source: PricingSource = {},
+    aliases: Record<string, string> = {},
+    official: Record<string, RoutePricing> = {},
+  ) {
     this.source = source
+    this.aliases = aliases
+    this.official = official
   }
 
   /** 解析某路由在某时段的三通道单价。 */
@@ -113,7 +132,12 @@ export class CachePricingEngine {
       if (rp) return { price: this.bandPriceOf(rp, band), source: 'override' }
     }
     if (this.source.global) return { price: this.bandPriceOf(this.source.global, band), source: 'override' }
-    const builtin = BUILTIN_CACHE_PRICES[modelOf(route)]
+    // 模型名别名归一：官方已下线但仍在使用的旧名路由到现行模型并按现行价计费
+    const canonical = this.aliases[modelOf(route)] ?? modelOf(route)
+    // 官方多厂商表（0.10.0）：officialPricing 启用时注入（含 DeepSeek 与全厂商，来源同注册表）
+    const official = this.official[canonical]
+    if (official) return { price: this.bandPriceOf(official, band), source: 'builtin' }
+    const builtin = BUILTIN_CACHE_PRICES[canonical]
     if (builtin) return { price: this.bandPriceOf(builtin, band), source: 'builtin' }
     return { price: { ...FALLBACK_CACHE_PRICE }, source: 'fallback' }
   }

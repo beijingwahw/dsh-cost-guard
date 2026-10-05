@@ -24,6 +24,20 @@
 
 import { clamp } from './math.js'
 
+// —— 动态水位缩放参数（背压 0..1 -> 水位在 [基线, 默认] 内线性上移）——
+/** 告警水位缩放基线：背压=0（无压力）时告警水位 = 默认告警水位 × 0.75。 */
+const GOVERNOR_WARN_BASE = 0.75
+/** 阻断水位缩放基线：背压=0 时阻断水位 = 默认阻断水位 × 0.85。 */
+const GOVERNOR_HARD_BASE = 0.85
+/** 默认阻断水位（无缩放时的上限基准 1.0）。 */
+const GOVERNOR_BLOCK_DEFAULT = 1
+/** 默认告警水位（无缩放时的上限基准 0.8）。 */
+const GOVERNOR_WARN_DEFAULT = 0.8
+/** 动态告警水位下限（收紧不越过该值，保持常态告警语义）。 */
+const GOVERNOR_WARN_MIN = 0.4
+/** 动态阻断水位下限（收紧不越过该值，保持常态阻断语义）。 */
+const GOVERNOR_HARD_MIN = 0.6
+
 /** 自适应调节器配置。 */
 export interface GovernorConfig {
   /** 月度预算上限（金额）。 */
@@ -82,25 +96,36 @@ export interface GovernorOutput {
   exhausted: boolean
 }
 
+/** 有限非负归一化（NaN/Infinity/负值按 0 处理，防止污染调节结果）。 */
+function nonNeg(v: number): number {
+  return Number.isFinite(v) && v > 0 ? v : 0
+}
+
 /** 由输入快照计算自适应调节结果（纯函数）。 */
 export function govern(config: GovernorConfig, input: GovernorInput): GovernorOutput {
   const cfg: GovernorConfig = { ...defaultGovernorConfig, ...config }
-  const daysLeft = Math.max(1, input.daysLeftInMonth)
+  const daysLeft = Math.max(1, nonNeg(input.daysLeftInMonth))
+  const monthSpent = nonNeg(input.monthSpent)
+  const daySpent = nonNeg(input.daySpent)
+  const carriedIn = nonNeg(input.carriedIn)
+  const dayProjected = input.dayProjected === undefined ? undefined : nonNeg(input.dayProjected)
+  const monthProjected = input.monthProjected === undefined ? undefined : nonNeg(input.monthProjected)
+  const monthLimit = nonNeg(cfg.monthLimit)
 
   // 1) 月度可用池：月预算 + 上期结转 - 本月已花
-  const monthAvailable = Math.max(0, cfg.monthLimit + input.carriedIn - input.monthSpent)
+  const monthAvailable = Math.max(0, monthLimit + carriedIn - monthSpent)
   // 预留缓冲后，分配给剩余天数的日均可用
   const dailyBase = daysLeft > 0 ? (monthAvailable * (1 - cfg.reserveRatio)) / daysLeft : 0
 
   // 2) 背压：预测超支时收紧
   let pressure = 1
-  if (input.dayProjected !== undefined && input.dayProjected > 0) {
-    const dayOk = dailyBase > 0 ? dailyBase / input.dayProjected : 0
+  if (dayProjected !== undefined && dayProjected > 0) {
+    const dayOk = dailyBase > 0 ? dailyBase / dayProjected : 0
     if (dayOk < 1) pressure = Math.min(pressure, 1 - (1 - dayOk) * cfg.backpressure)
   }
-  if (input.monthProjected !== undefined && input.monthProjected > 0) {
-    const monthOk = cfg.monthLimit + input.carriedIn > 0
-      ? (cfg.monthLimit + input.carriedIn) / input.monthProjected
+  if (monthProjected !== undefined && monthProjected > 0) {
+    const monthOk = monthLimit + carriedIn > 0
+      ? (monthLimit + carriedIn) / monthProjected
       : 0
     if (monthOk < 1) {
       const monthPressure = 1 - (1 - monthOk) * cfg.backpressure
@@ -115,18 +140,19 @@ export function govern(config: GovernorConfig, input: GovernorInput): GovernorOu
   const dayAllowance = monthAvailable > 0 ? Math.max(floor, dayAllowanceRaw, 0) : 0
   // 0.5.0 语义：日额度不用于『超过日上限即熔断』——日预算仍有独立 hardAt，
   // 此处动态额度驱动的是水位缩放与展示；今日可用不足时标记 exhausted。
-  const dayRemaining = Math.max(0, dayAllowance - input.daySpent)
-  const exhausted = dayAllowance > 0 && input.daySpent >= dayAllowance
+  const dayRemaining = Math.max(0, dayAllowance - daySpent)
+  const exhausted = dayAllowance > 0 && daySpent >= dayAllowance
 
   // 4) 动态水位：背压越强，告警/阻断越提前
-  const warnScale = 0.75 + 0.25 * pressure
-  const hardScale = 0.85 + 0.15 * pressure
-  const warnAt = clamp(0.8 * warnScale, 0.4, 0.8)
-  const hardAt = clamp(1 * hardScale, 0.6, 1)
+  //    缩放公式：基线 + (1-基线) × pressure，随背压从 [基线, 1] 线性上移
+  const warnScale = GOVERNOR_WARN_BASE + (1 - GOVERNOR_WARN_BASE) * pressure
+  const hardScale = GOVERNOR_HARD_BASE + (1 - GOVERNOR_HARD_BASE) * pressure
+  const warnAt = clamp(GOVERNOR_WARN_DEFAULT * warnScale, GOVERNOR_WARN_MIN, GOVERNOR_WARN_DEFAULT)
+  const hardAt = clamp(GOVERNOR_BLOCK_DEFAULT * hardScale, GOVERNOR_HARD_MIN, GOVERNOR_BLOCK_DEFAULT)
 
   // 5) 结转与月末预测
-  const monthProjected = input.monthProjected ?? input.monthSpent
-  const projectedMonthRemaining = cfg.monthLimit + input.carriedIn - monthProjected
+  const monthProjectedFinal = monthProjected ?? monthSpent
+  const projectedMonthRemaining = monthLimit + carriedIn - monthProjectedFinal
   const carryOver = Math.max(0, projectedMonthRemaining) * cfg.carryOverRatio
 
   return { dayAllowance, dayRemaining, pressure, warnAt, hardAt, projectedMonthRemaining, carryOver, exhausted }

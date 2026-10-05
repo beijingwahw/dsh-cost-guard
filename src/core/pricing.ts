@@ -76,19 +76,25 @@ export function priceFor(table: PricingTable, route: Route): { price: ModelPrice
 
 /**
  * 按 TokenUsage 与价格折算金额。
- * 计费 token = input + cacheRead + output（cacheWrite 不单独计价）。
+ * 计费 token = input + cacheRead + output。
+ * 可选缓存写价（Anthropic 官方按写入 token 单独计价）：
+ *   price.cacheWritePerMillion 存在且 usage 提供 cacheWriteTokens 时加算；
+ *   未配置写价或用量缺省时该项为 0 —— 与既有三通道口径完全一致（零回归）。
  */
 export function computeCost(
   price: ModelPrice,
-  usage: Pick<TokenUsageLike, 'inputTokens' | 'outputTokens' | 'cacheReadTokens'>,
+  usage: Pick<TokenUsageLike, 'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheWriteTokens'>,
 ): number {
   const input = usage.inputTokens || 0
   const output = usage.outputTokens || 0
   const cacheRead = usage.cacheReadTokens || 0
+  const cacheWritePerMillion = price.cacheWritePerMillion
+  const cacheWrite = cacheWritePerMillion === undefined ? 0 : usage.cacheWriteTokens || 0
   return (
     (input * price.inputPerMillion +
       cacheRead * price.cacheReadPerMillion +
-      output * price.outputPerMillion) /
+      output * price.outputPerMillion +
+      cacheWrite * (cacheWritePerMillion ?? 0)) /
     1_000_000
   )
 }
@@ -132,8 +138,9 @@ export function formatCredits(credits: number): string {
 export function parseBandMinutes(hhmm: string): number {
   const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm)
   if (!m) return -1
-  const h = Number(m[1])
-  const min = Number(m[2])
+  // 正则已保证捕获组存在；防御性取值避免 NaN 路径（noUncheckedIndexedAccess）。
+  const h = m[1] === undefined ? -1 : Number(m[1])
+  const min = m[2] === undefined ? -1 : Number(m[2])
   if (h < 0 || h > 23 || min < 0 || min > 59) return -1
   return h * 60 + min
 }

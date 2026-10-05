@@ -96,6 +96,9 @@ export interface PredictiveTrigger {
 /** 成本感知提示级别（0.5.0）：由 governor 的背压状态推导。 */
 export type AdaptiveCue = 'calm' | 'frugal' | 'minimal'
 
+/** 背压 >= 该值判定为「高压力」：今日额度过半且预测正常时切换为从容提示。 */
+const PRESSURE_CALM_THRESHOLD = 0.85
+
 export interface BudgetEvaluator {
   /** 按当前花费快照（+ 可选预测事实）计算决策。 */
   decide(spent: BudgetInput): BudgetDecision
@@ -118,19 +121,25 @@ export function createBudgetEvaluator(policies: BudgetPolicy[], predictive?: Pre
     const predictiveTriggers: PredictiveTrigger[] = []
     let action: BudgetDecision['action'] = 'allow'
 
+    /** 动作升级：hard -> block（一票否决）；warn -> 仅当仍为 allow 时升级。 */
+    const escalate = (level: 'warn' | 'hard'): void => {
+      if (level === 'hard') action = 'block'
+      else if (action === 'allow') action = 'warn'
+    }
+
     // —— 0. 自适应调节（0.5.0）：启用时用 governor 动态水位替代静态水位 ——
     const adaptiveCfg = predictive?.adaptive
     const adaptiveScope = adaptiveCfg?.scope ?? 'day'
     const governor = adaptiveCfg ? spent.adaptive?.governor : undefined
-    const adaptiveActive = adaptiveCfg !== undefined && governor !== undefined
 
     // —— 1. 既有水位判定（0.3.0 语义；adaptive 启用时指定 scope 用动态水位）——
     for (const p of sorted) {
       const used = spent.spent[p.scope] ?? 0
       if (p.limit <= 0) continue
       const ratio = used / p.limit
-      const warnAt = adaptiveActive && p.scope === adaptiveScope ? governor!.warnAt : p.warnAt
-      const hardAt = adaptiveActive && p.scope === adaptiveScope ? governor!.hardAt : p.hardAt
+      const dynamicForScope = governor !== undefined && p.scope === adaptiveScope
+      const warnAt = dynamicForScope ? governor.warnAt : p.warnAt
+      const hardAt = dynamicForScope ? governor.hardAt : p.hardAt
       if (ratio >= hardAt) {
         triggers.push({ scope: p.scope, spent: used, limit: p.limit, ratio, level: 'hard' })
         action = 'block'
@@ -141,26 +150,25 @@ export function createBudgetEvaluator(policies: BudgetPolicy[], predictive?: Pre
     }
 
     // —— 1.5 自适应调节补充（0.5.0）——
-    if (adaptiveActive) {
+    if (governor !== undefined) {
       // 今日动态额度耗尽：立即按策略告警/熔断，不等到水位
-      if (governor!.exhausted) {
-        const exhaustedAction: 'warn' | 'block' = adaptiveCfg!.onExhausted ?? 'warn'
+      if (governor.exhausted) {
+        const exhaustedAction: 'warn' | 'block' = adaptiveCfg?.onExhausted ?? 'warn'
         predictiveTriggers.push({
           kind: 'adaptive',
           scope: adaptiveScope,
           level: exhaustedAction === 'block' ? 'hard' : 'warn',
-          detail: `今日自适应额度已耗尽（已花 ≥ ${governor!.dayAllowance.toFixed(2)}）${exhaustedAction === 'block' ? '，已熔断本周期' : '，请降低调用频率'}`,
+          detail: `今日自适应额度已耗尽（已花 ≥ ${governor.dayAllowance.toFixed(2)}）${exhaustedAction === 'block' ? '，已熔断本周期' : '，请降低调用频率'}`,
         })
-        if (exhaustedAction === 'block') action = 'block'
-        else if (action === 'allow') action = 'warn'
+        escalate(exhaustedAction === 'block' ? 'hard' : 'warn')
       }
     }
 
     // —— 2. 到期投影治理（预测成本提前触发）——
     if (predictive?.projections && spent.forecast?.projected) {
-      for (const [scope, proj] of Object.entries(predictive.projections)) {
-        if (!proj) continue
-        const s = scope as BudgetScope
+      for (const [scopeKey, proj] of Object.entries(predictive.projections)) {
+        if (!proj || !isBudgetScope(scopeKey)) continue
+        const s: BudgetScope = scopeKey
         const policy = sorted.find((x) => x.scope === s)
         if (!policy || policy.limit <= 0) continue
         const projected = spent.forecast.projected[s]
@@ -198,8 +206,7 @@ export function createBudgetEvaluator(policies: BudgetPolicy[], predictive?: Pre
         level: spikeCfg.action === 'block' ? 'hard' : 'warn',
         detail: `检测到成本尖峰（${spikeIn.level}），按策略${spikeCfg.action === 'block' ? '熔断' : '告警'}`,
       })
-      if (spikeCfg.action === 'block') action = 'block'
-      else if (action === 'allow') action = 'warn'
+      escalate(spikeCfg.action === 'block' ? 'hard' : 'warn')
     }
 
     // —— 4. 请求级预检（花出去之前判断）——
@@ -219,8 +226,7 @@ export function createBudgetEvaluator(policies: BudgetPolicy[], predictive?: Pre
             level: preCfg.action === 'block' ? 'hard' : 'warn',
             detail: `请求预检（${preCfg.mode}）预计花费 ${cost.toFixed(4)}，将使 ${scope} 预算 ${used.toFixed(2)}/${limit.toFixed(2)} 越线，${preCfg.action === 'block' ? '已拦截' : '请留意'}`,
           })
-          if (preCfg.action === 'block') action = 'block'
-          else if (action === 'allow') action = 'warn'
+          escalate(preCfg.action === 'block' ? 'hard' : 'warn')
         }
       }
     }
@@ -228,12 +234,12 @@ export function createBudgetEvaluator(policies: BudgetPolicy[], predictive?: Pre
     const decision: BudgetDecision = { action, triggers }
     if (predictiveTriggers.length > 0) decision.predictive = predictiveTriggers
     // 自适应调节状态与成本感知 cue（0.5.0；仅启用时存在）
-    if (adaptiveActive) {
-      // cue：今日额度耗尽 -> minimal（最小化）；高压力 -> frugal（节约）；否则 calm（从容）
-      const cue: AdaptiveCue = governor!.exhausted ? 'minimal' : governor!.pressure >= 0.85 ? 'calm' : 'frugal'
+    if (governor !== undefined) {
+      // cue：今日额度耗尽 -> minimal（最小化）；高压力（>= 0.85）-> calm（从容）；否则 frugal（节约）
+      const cue: AdaptiveCue = governor.exhausted ? 'minimal' : governor.pressure >= PRESSURE_CALM_THRESHOLD ? 'calm' : 'frugal'
       decision.adaptive = {
         scope: adaptiveScope,
-        governor: governor!,
+        governor,
         cue,
       }
     }
@@ -285,6 +291,11 @@ export interface PredictiveConfig {
   adaptive?: { scope?: BudgetScope; onExhausted?: 'warn' | 'block' }
 }
 
+/** 投影配置键守卫：仅合法 BudgetScope 参与投影判定。 */
+function isBudgetScope(v: string): v is BudgetScope {
+  return v === 'session' || v === 'day' || v === 'month' || v === 'total'
+}
+
 /** 从配置构造预测式治理策略；未配置任何项返回 undefined（不改变既有语义）。 */
 export function predictivePolicyFromConfig(cfg?: PredictiveConfig): PredictivePolicy | undefined {
   if (!cfg) return undefined
@@ -292,9 +303,9 @@ export function predictivePolicyFromConfig(cfg?: PredictiveConfig): PredictivePo
   if (cfg.projections) {
     const projections: NonNullable<PredictivePolicy['projections']> = {}
     for (const [scope, p] of Object.entries(cfg.projections)) {
-      if (!p) continue
-      projections[scope as BudgetScope] = {
-        target: p.target,
+      if (!p || !isBudgetScope(scope)) continue
+      projections[scope] = {
+        ...(p.target !== undefined ? { target: p.target } : {}),
         warnAt: p.warnAt ?? 0.8,
         hardAt: p.hardAt ?? 1,
       }

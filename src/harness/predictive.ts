@@ -111,5 +111,5 @@ export function preStepEstimate(
   const inputTokens = Math.max(1, Math.round(chars / 4))
   const { price } = priceFor(runtime.pricing, runtime.fallbackRoute)
   if (!price) return undefined
-  return estimateRequestCost(inputTokens, price, { outputRatio: runtime.outputRatio })
+  return estimateRequestCost(inputTokens, price, runtime.outputRatio !== undefined ? { outputRatio: runtime.outputRatio } : {})
 }

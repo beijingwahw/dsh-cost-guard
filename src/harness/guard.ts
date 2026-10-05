@@ -75,17 +75,34 @@ export function attachGuard(
   meter: Meter,
   options: GuardOptions,
 ): GuardHandle {
+  const logger = ctx.logger('cost-guard')
+
+  /**
+   * 宿主回调隔离：宿主注入的任意回调（估算 / forecast / adaptive / 通知）
+   * 抛错都不允许反噬 pre-step 主流程，记录可识别错误并降级为 undefined。
+   */
+  const safeHost = <T>(label: string, fn: () => T): T | undefined => {
+    try {
+      return fn()
+    } catch (err) {
+      logger.error(
+        `[cost-guard] 宿主回调(${label})异常，已降级跳过: ${err instanceof Error ? err.message : String(err)}`,
+      )
+      return undefined
+    }
+  }
+
   const decisionWith = (estimate?: RequestEstimate): BudgetDecision => {
-    const forecast = options.forecastInput?.()
+    const forecast = safeHost('forecastInput', () => options.forecastInput?.())
     const merged: BudgetInput['forecast'] = forecast ? { ...forecast } : {}
     if (estimate) merged.estimate = estimate
-    const adaptive = options.adaptiveInput?.(merged)
+    const adaptive = safeHost('adaptiveInput', () => options.adaptiveInput?.(merged))
     return evaluator.decide(budgetInputFromMeter(meter, merged, adaptive))
   }
 
   const inspectAlways = (): BudgetDecision => {
-    const forecast = options.forecastInput?.()
-    const adaptive = options.adaptiveInput?.(forecast)
+    const forecast = safeHost('forecastInput', () => options.forecastInput?.())
+    const adaptive = safeHost('adaptiveInput', () => options.adaptiveInput?.(forecast))
     return evaluator.decide(budgetInputFromMeter(meter, forecast, adaptive))
   }
 
@@ -106,17 +123,22 @@ export function attachGuard(
       payload: { agent: Agent; messages: UserMessage[]; turn: number; step: number; signal: AbortSignal },
       next: () => Promise<PreStepDecision>,
     ): Promise<PreStepDecision> => {
-      // 请求级预检：消息序列字符量 -> 估算本次调用成本
-      let estimate: RequestEstimate | undefined
-      let chars = 0
+      let decision: BudgetDecision
       try {
-        chars = JSON.stringify(payload.messages ?? []).length
-      } catch {
-        chars = 0
+        // 请求级预检：消息序列字符量 -> 估算本次调用成本
+        let chars = 0
+        try {
+          chars = JSON.stringify(payload.messages ?? []).length
+        } catch {
+          chars = 0
+        }
+        const estimate = safeHost('estimateFromMessages', () => options.estimateFromMessages?.(chars))
+        decision = decisionWith(estimate)
+      } catch (err) {
+        // 评估本身异常：不阻断请求（避免插件故障反噬宿主推理），但必须可识别
+        logger.error(`[cost-guard] 预算评估异常，本轮放行: ${err instanceof Error ? err.message : String(err)}`)
+        return next()
       }
-      estimate = options.estimateFromMessages?.(chars)
-
-      const decision = decisionWith(estimate)
       state.lastDecision = decision
 
       if (decision.action === 'block') {
@@ -124,11 +146,13 @@ export function attachGuard(
         const predictiveHard = decision.predictive?.find((t) => t.level === 'hard')
         const scope = hard?.scope ?? predictiveHard?.scope ?? 'total'
         const reason = `[cost-guard] ${scope} 预算已耗尽 (${hard ? hard.spent.toFixed(2) : '?'}/${hard ? hard.limit.toFixed(2) : '?'})，已熔断。`
-        ctx.logger('cost-guard').warn(reason)
+        logger.warn(reason)
         if (predictiveHard && !hard) {
-          ctx.logger('cost-guard').warn(`[cost-guard] 预测式熔断：${predictiveHard.detail}`)
+          logger.warn(`[cost-guard] 预测式熔断：${predictiveHard.detail}`)
         }
-        options.onViolation?.(decision, scope)
+        safeHost('onViolation', () => {
+          options.onViolation?.(decision, scope)
+        })
         if (options.cancelOnBlock) {
           try {
             payload.agent.cancel({ kind: 'hook', reason })
@@ -143,14 +167,18 @@ export function attachGuard(
         const w = decision.triggers.find((t) => t.level === 'warn')
         const predictiveWarn = decision.predictive?.find((t) => t.level === 'warn')
         if (w) {
-          ctx.logger('cost-guard').warn(
+          logger.warn(
             `[cost-guard] ${w.scope} 预算达到 ${Math.round(w.ratio * 100)}% (${w.spent.toFixed(2)}/${w.limit.toFixed(2)})，请留意。`,
           )
-          options.onViolation?.(decision, w.scope)
+          safeHost('onViolation', () => {
+            options.onViolation?.(decision, w.scope)
+          })
         }
         if (predictiveWarn && !w) {
-          ctx.logger('cost-guard').warn(`[cost-guard] 预测式告警：${predictiveWarn.detail}`)
-          options.onViolation?.(decision, predictiveWarn.scope ?? 'total')
+          logger.warn(`[cost-guard] 预测式告警：${predictiveWarn.detail}`)
+          safeHost('onViolation', () => {
+            options.onViolation?.(decision, predictiveWarn.scope ?? 'total')
+          })
         }
       }
 

@@ -25,8 +25,8 @@ export function parseCachedUsage(raw: RawUsageSnapshot | null | undefined): Pars
   if (!raw) return { ok: false, reason: 'missing', rawPrompt: 0 }
   const prompt = raw.promptTokens
   if (!Number.isFinite(prompt) || prompt < 0) {
-    // 输入总量本身异常：视为无法确认（数据异常）
-    return { ok: false, reason: 'malformed', rawPrompt: prompt }
+    // 输入总量本身异常：视为无法确认（数据异常）；NaN/Infinity 归 0 防污染
+    return { ok: false, reason: 'malformed', rawPrompt: Number.isFinite(prompt) && prompt < 0 ? prompt : 0 }
   }
   const cached = raw.cachedTokens
   if (cached === undefined || cached === null) {

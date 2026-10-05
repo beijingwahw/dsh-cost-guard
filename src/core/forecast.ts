@@ -101,6 +101,26 @@ function clamp01(v: number): number {
   return Math.min(1, Math.max(0, v))
 }
 
+// —— 启发式可信度 / 不确定性权重（调参点；保持与 0.6.0 行为一致）——
+/** 趋势模型置信度基准权重：拟合度（R²）上限贡献。 */
+const TREND_CONF_BASE = 0.5
+/** 趋势模型置信度：R² 占比权重。 */
+const TREND_CONF_R2_WEIGHT = 0.4
+/** 趋势模型置信度：样本充足度（20 点达上限）占比权重。 */
+const TREND_CONF_SAMPLE_WEIGHT = 0.1
+/** 趋势模型置信度：样本饱和点数（>= 该值视为数据充分）。 */
+const TREND_SAMPLE_SATURATION = 20
+/** 趋势模型外推不确定性的展宽系数（随外推距离线性增长）。 */
+const TREND_HORIZON_SPREAD = 0.25
+/** 速率模型不确定性下界为期望成本的比例（估计跨度远小于单点参考时使用）。 */
+const RATE_UNCERT_RATIO = 0.5
+/** 速率模型置信度基准：观测跨度比例占比权重。 */
+const RATE_CONF_BASE = 0.3
+/** 速率模型置信度：跨度充足度占比权重。 */
+const RATE_CONF_SPAN_WEIGHT = 0.4
+/** 速率模型置信度：跨度饱和参考（单点参考跨度的 12 倍视为数据充分）。 */
+const RATE_SPAN_SATURATION_X = 12
+
 export interface ForecastOptions {
   /** 观测点（按时间升序或乱序均可，内部排序）。 */
   points: ForecastPoint[]
@@ -123,8 +143,9 @@ export function buildForecast(opts: ForecastOptions): CostForecast | undefined {
   if (points.length === 0 || targetAt <= now) return undefined
   const sorted = [...points].sort((a, b) => a.t - b.t)
   if (sorted.length === 0) return undefined
-  const firstPoint = sorted[0]!
-  const lastPoint = sorted[sorted.length - 1]!
+  const firstPoint = sorted[0]
+  const lastPoint = sorted[sorted.length - 1]
+  if (firstPoint === undefined || lastPoint === undefined) return undefined
 
   // —— 线性趋势模型（>=2 个分布在不同时刻的观测点）——
   const fit =
@@ -133,9 +154,9 @@ export function buildForecast(opts: ForecastOptions): CostForecast | undefined {
     const expected = Math.max(0, fit.slope * targetAt + fit.intercept)
     // 外推不确定性 = 拟合残差标准误 + 外推距离线性展宽（越远越不确定）
     const horizon = targetAt - now
-    const band = z * (fit.se + Math.abs(fit.slope) * horizon * 0.25)
+    const band = z * (fit.se + Math.abs(fit.slope) * horizon * TREND_HORIZON_SPREAD)
     const confidence = clamp01(
-      0.5 + fit.r2 * 0.4 + Math.min(1, sorted.length / 20) * 0.1,
+      TREND_CONF_BASE + fit.r2 * TREND_CONF_R2_WEIGHT + Math.min(1, sorted.length / TREND_SAMPLE_SATURATION) * TREND_CONF_SAMPLE_WEIGHT,
     )
     return {
       expected,
@@ -155,9 +176,9 @@ export function buildForecast(opts: ForecastOptions): CostForecast | undefined {
     const expected = Math.max(0, lastPoint.y + ratePerMs * horizon)
     // 观测跨度越短，速率估计越不可靠 -> 置信带越宽
     const span = sorted.length === 1 ? singlePointSpanMs : lastPoint.t - firstPoint.t
-    const uncertRatio = clamp01((span > 0 ? singlePointSpanMs / span : 1) * 0.5)
+    const uncertRatio = clamp01((span > 0 ? singlePointSpanMs / span : 1) * RATE_UNCERT_RATIO)
     const band = Math.max(z * Math.sqrt(Math.max(0, expected)), expected * uncertRatio)
-    const confidence = clamp01(0.3 + 0.4 * Math.min(1, span / Math.max(1, singlePointSpanMs * 12)))
+    const confidence = clamp01(RATE_CONF_BASE + RATE_CONF_SPAN_WEIGHT * Math.min(1, span / Math.max(1, singlePointSpanMs * RATE_SPAN_SATURATION_X)))
     return {
       expected,
       lower: Math.max(0, expected - band),

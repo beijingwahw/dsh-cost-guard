@@ -1,7 +1,7 @@
 {
   "name": "dsh-cost-guard",
-  "version": "0.6.0",
-  "description": "DeepSeek Harness 原生实时成本治理插件：实时计量、多维预算、熔断防护、成本面板、预测式治理（趋势外推 + 请求预检 + 尖峰检测）、自适应调节（月→日额度动态派生 + 消费速率背压 + 跨周期结转）、成本效率洞察与缓存维度计量（三通道×峰谷定价、命中率/收益/前缀提示）。",
+  "version": "0.18.0",
+  "description": "DeepSeek Harness 原生实时成本治理插件：实时计量、多维预算、熔断防护、成本面板、预测式治理（趋势外推 + 请求预检 + 尖峰检测）、自适应调节（月→日额度动态派生 + 消费速率背压 + 跨周期结转）、成本效率洞察、缓存维度计量（三通道×峰谷定价、命中率/收益/前缀提示）、国内外全厂商官方计价深度同步（OpenAI/Anthropic/Google/Mistral/DeepSeek 及智谱GLM/阿里通义Qwen/字节豆包/月之暗面Kimi/百度文心/百川/MiniMax/阶跃星辰/讯飞星火官方价目注册表、CNY/USD 原币种、峰谷策略、缓存读写价、推理 token、别名归一）、前沿套件 frontier（FOCUS 成本台账列规、OTel GenAI 遥测语义、单位经济学成本归属、缓存/输出成本杠杆）、成本根因解释（会话/路由双视角增量贡献分解 + 中文可解释叙事 + 只读诊断工具 cost_guard_explain）与告警根因解释（Guard 告警/熔断触发时同一条通知输出「为什么超」的中文告警根因叙事：scope/水位/Δ + 会话/路由主因 + 建议，可转发 IM；首次触发沉淀基线、后续与告警前基线增量归因）与多租户成本解释视图（Multi-Tenant Cost Explanation View：sessionId→租户解析 mapping/prefixes/regex + 租户聚合 + 租户间归因主因/次因/噪声分级 + 租户内主因会话两级证据链 + 中文叙事 + 只读工具 cost_guard_tenant，回答「哪个团队/项目/工作区在烧钱」）与推理成本专项治理（Reasoning Tax Governance：把思维链「思考税」从展示项升级为可治理对象——独立账本按路由聚合推理 token/可见输出，按输出价估算税成本与思考税占比（推理 token 常为可见输出 5~20 倍，是账单最大隐藏成本，市面 DSH 成本插件均无此专项）+ 独立推理税预算水位 ok/warn/block + 中文治理叙事（思考预算压缩/路由降级/切换非推理模型）+ 只读工具 cost_guard_reasoning）与多维思考税审计（Multi-Dimension Reasoning Tax Audit：在路由归因之上新增会话维度 Top N 排行 + 时间热力桶双切片审计账本——「哪个会话在烧思考税 / 一天中何时烧得最集中」+ 中文审计叙事（主因会话/热力峰值/会话收敛与错峰建议）+ 只读工具 cost_guard_reasoning_audit，市面无同类工具）。",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -20,10 +20,10 @@
     "node": "^22.19.0 || >=24.0.0"
   },
   "main": "lib/index.js",
-  "types": "lib/types/index.d.ts",
+  "types": "lib/index.d.ts",
   "exports": {
     ".": {
-      "types": "./lib/types/index.d.ts",
+      "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
     "./package.json": "./package.json"
@@ -49,7 +49,6 @@
     "@deepseek-ai/dsh-tools": ">=0.1.1-rc.2 <0.2.0",
     "@deepseek-ai/schemastery": "^3.18.1"
   },
-  "dependencies": {},
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.4",
     "@deepseek-ai/dsh-agent": "0.1.1-rc.2",
@@ -57,8 +56,12 @@
     "@deepseek-ai/dsh-session": "0.1.1-rc.2",
     "@deepseek-ai/dsh-tools": "0.1.1-rc.2",
     "@deepseek-ai/schemastery": "3.18.1",
+    "@eslint/js": "^10.0.1",
     "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "^3.2.7",
+    "eslint": "^10.12.0",
     "typescript": "^5.6.3",
+    "typescript-eslint": "^8.71.0",
     "vitest": "^3.0.5"
   },
   "scripts": {

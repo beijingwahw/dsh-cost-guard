@@ -33,11 +33,19 @@ export class CostTrail {
       this.series.set(scope, arr)
     }
     // 有序插入：事件可能乱序 / 回放，保证时间升序（预测引擎依赖排序）
+    // 从尾部向前找第一个 time <= 新点的位置；防御性取值避免索引未定义。
     let i = arr.length - 1
-    while (i >= 0 && arr[i]!.time > time) i--
-    if (i >= 0 && arr[i]!.time === time) {
-      arr[i]!.cost = cost // 同一时刻幂等覆盖
-      return arr.length
+    while (i >= 0) {
+      const cur = arr[i]
+      if (cur === undefined || cur.time <= time) break
+      i--
+    }
+    if (i >= 0) {
+      const cur = arr[i]
+      if (cur !== undefined && cur.time === time) {
+        cur.cost = cost // 同一时刻幂等覆盖
+        return arr.length
+      }
     }
     arr.splice(i + 1, 0, { time, cost })
     while (arr.length > this.capacity) arr.shift()

@@ -108,8 +108,11 @@ function medianOf(sorted: number[]): number {
   const n = sorted.length
   if (n === 0) return 0
   const mid = Math.floor(n / 2)
-  if (n % 2 === 1) return sorted[mid]!
-  return (sorted[mid - 1]! + sorted[mid]!) / 2
+  // n>=1 时 mid 必在界内；n>=2 时 mid-1 在界内。防御性取值避免索引未定义。
+  const hiVal = sorted[mid] ?? 0
+  if (n % 2 === 1) return hiVal
+  const loVal = sorted[mid - 1] ?? 0
+  return (loVal + hiVal) / 2
 }
 
 // ---------------------------------------------------------------------------

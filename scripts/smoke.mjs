@@ -234,7 +234,7 @@ const bst = bctx.costGuard.status()
 // 实时追踪：当前时段带判定与实时时钟自洽
 const expectedBand = bandIdForEpoch(bands, Date.now(), 480)
 assert.equal(bst.band.current, expectedBand, '当前时段带判定与实时时钟一致')
-assert.ok(['peak', 'valley'].includes(bst.band.current), '当前时段属于已配置带')
+assert.ok(['peak', 'valley', 'base'].includes(bst.band.current), '当前时段属于已配置带或带间（base）')
 assert.equal(bst.band.schedule.length, 2, '时段定义表完整')
 // 峰段使用带内价 6 元（非基准 2 元）；凌晨 valley 回退基准 2 元 -> 累计 8
 assert.equal(bst.total.cost, 8, '峰值 6 + 谷值 2 = 8 元')
@@ -476,7 +476,7 @@ assert.ok(st2.efficiency.distribution.p95 > st2.efficiency.distribution.p50, 'P9
 assert.ok(Array.isArray(st2.efficiency.replacement), '替代节约建议字段存在')
 ok('8.4 效率洞察：请求成本分布（P50/P95/Max）+ 路由每千输出 token 成本正确')
 
-// ---- 9. 缓存维度计量（0.6.0）：三通道解析 + 命中率/收益/不确定 + 面板输出 ----
+// ---- 9. 缓存维度计量（0.7.0）：三通道解析 + 命中率/收益/不确定 + 面板输出 ----
 console.log(`\n[${++step}] 缓存维度计量（真实 Context 事件 → 命中率 / 收益 / 不确定 / 面板输出）`)
 // 9.1 apply 全装配 + cache.enabled=true：事件驱动缓存账本
 const cctx = new Context()
@@ -581,7 +581,7 @@ assert.equal(c2.hitRate, 1)
 assert.ok(Math.abs(c2.savingTotal - 0.98) < 1e-6, '全命中收益复算 = (1.0-0.02) × 1M/1M = 0.98 元')
 ok('9.2 内置官方价复算：全命中收益 = 未命中价 - 命中价（flash 空闲 0.98 元）')
 
-// ---- 10. 回退与零回归（0.6.0）：缺失字段按未命中计费 + 连续回退提示 + 未启用零回归 ----
+// ---- 10. 回退与零回归（0.7.0）：缺失字段按未命中计费 + 连续回退提示 + 未启用零回归 ----
 console.log(`\n[${++step}] 回退与零回归（缺失字段按未命中计费 / 连续 5 次提示 / 未启用时输出与 0.5.0 一致）`)
 // 10.1 未启用 cache：apply 输出不含 cache 段，摘要无缓存行（零回归）
 const zctx = new Context()
@@ -643,5 +643,517 @@ assert.equal(rs.uncertainCount, 5, '5 次缺失全部按未命中计费并计不
 assert.equal(rs.inputTotal, 0, '不确定请求不污染可信命中率口径')
 ok('10.2 连续 5 次回退：一次性提示 + 全部按未命中计费 + uncertainCount=5 且不污染命中率')
 
+// ---- 11. 官方计价引擎（0.8.0）：官方价目 + 官方峰谷自动挂载 + 别名归一 + 推理洞察 ----
+section('官方计价引擎（官方价/官方峰谷/别名归一/推理 token 洞察）')
+const ofCtx = new Context()
+const ofTools = []
+ofCtx.tools = { register: (def) => ofTools.push(def) }
+apply(ofCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {},
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  officialPricing: { enabled: true },
+})
+// 周一（2026-09-14）10:00 +08：官方高峰时段 → flash 未命中 1 → 高峰 ×2 = 2 元/M
+ofCtx.emit(
+  'session/event',
+  { get id() { return 'smoke-official-peak' } },
+  {
+    type: 'assistant/message',
+    time: Date.UTC(2026, 8, 14, 2, 0, 0),
+    data: { provider: 'deepseek', model: 'deepseek-flash', usage: { inputTokens: 1_000_000, outputTokens: 0, reasoningTokens: 100_000 } },
+  },
+)
+// 旧模型名（deepseek-v4-flash）空闲时段（周一 13:00 +08）→ 别名归一 flash idle 价 1 元/M
+ofCtx.emit(
+  'session/event',
+  { get id() { return 'smoke-official-alias' } },
+  {
+    type: 'assistant/message',
+    time: Date.UTC(2026, 8, 14, 5, 0, 0),
+    data: { provider: 'deepseek', model: 'deepseek-v4-flash', usage: { inputTokens: 1_000_000, outputTokens: 0 } },
+  },
+)
+const ost = ofCtx.costGuard.status()
+assert.ok(ost.official, 'officialPricing.enabled：状态包含官方计价段')
+assert.equal(ost.official.peakMultiplier, 2, '官方高峰倍数 = 2')
+assert.equal(ost.official.currentBand, 'idle', '当前（沙箱真实时间）官方时段判定存在')
+const flashPrices = ost.official.prices['deepseek-flash']
+assert.ok(flashPrices, '官方价目包含 deepseek-flash')
+assert.equal(flashPrices.idle.inputPerMillion, 1, 'flash 空闲未命中 1 元/M')
+assert.equal(flashPrices.peak.inputPerMillion, 2, 'flash 高峰未命中 = 1 × 2')
+assert.equal(flashPrices.idle.cacheReadPerMillion, 0.02, 'flash 缓存命中 0.02 元/M')
+assert.equal(flashPrices.idle.outputPerMillion, 4, 'flash 输出 4 元/M')
+assert.equal(ost.official.prices['deepseek-v4-pro'].peak.cacheReadPerMillion, 0.3, 'v4-pro 高峰缓存命中 0.3 元/M')
+// 高峰 flash：1M in × 2 元/M = 2 元
+const peakTotal = ost.routes['deepseek/deepseek-flash']
+assert.ok(peakTotal && Math.abs(peakTotal.cost - 2) < 1e-6, '官方高峰 flash 未命中 1M = 2 元')
+// 别名旧名 idle：1M in × 1 元/M = 1 元（不再落兜底最贵档）
+const aliasTotal = ost.routes['deepseek/deepseek-v4-flash']
+assert.ok(aliasTotal && Math.abs(aliasTotal.cost - 1) < 1e-6, '旧名 deepseek-v4-flash 归一到 flash idle 价 = 1 元')
+// 推理 token 洞察：100k 推理 × flash 输出价 4/1M = 0.4 元
+assert.ok(ost.official.reasoning && ost.official.reasoning.reasoningTokens === 100_000, '推理 token 独立采集')
+assert.ok(Math.abs(ost.official.reasoning.cost - 0.4) < 1e-6, '推理成本按官方输出价估算 = 0.4 元')
+const osummary = ofCtx.costGuard.summary()
+assert.ok(osummary.includes('官方计价'), '摘要含官方计价行')
+assert.ok(osummary.includes('推理token'), '摘要含推理 token 行')
+ok('11.1 官方计价引擎：官方价并入 + 峰谷自动选带 + 旧名归一 + 推理洞察全部生效')
+// 零回归锚点：officialPricing 未配置时无 official 段
+const noofCtx = new Context()
+const noofTools = []
+noofCtx.tools = { register: (def) => noofTools.push(def) }
+apply(noofCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {},
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+})
+const noofSt = noofCtx.costGuard.status()
+assert.equal(noofSt.official, undefined, '未启用官方计价：状态无 official 段（零回归）')
+assert.ok(!noofCtx.costGuard.summary().includes('官方计价'), '摘要不含官方计价行（零回归）')
+ok('11.2 未启用 officialPricing：输出与 0.7.0 完全一致（无 official 段 / 无官方计价行）')
+
+// ---- 12. 成本根因解释（0.14.0） ----
+section('成本根因解释（会话/路由双视角归因 + 中文叙事 + 只读工具）')
+const exCtx = new Context()
+const exTools = []
+exCtx.tools = { register: (def) => exTools.push(def) }
+apply(exCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {},
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+  explain: { enabled: true },
+})
+assert.ok(exTools.some((t) => t.name === 'cost_guard_explain'), 'explain.enabled=true：注册 cost_guard_explain 只读工具')
+// 两个任务：taskA 占大头（主因）、taskB 小头（次因）
+exCtx.emit(
+  'session/event',
+  { get id() { return 'taskA' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { provider: 'deepseek', model: 'deepseek-chat', usage: { inputTokens: 900_000, outputTokens: 100_000 } },
+  },
+)
+exCtx.emit(
+  'session/event',
+  { get id() { return 'taskB' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { provider: 'deepseek', model: 'deepseek-flash', usage: { inputTokens: 100_000, outputTokens: 10_000 } },
+  },
+)
+const exst = exCtx.costGuard.status()
+assert.ok(exst.explain, '启用 explain：状态面板含根因段')
+assert.equal(exst.explain.window, 'current', '面板窗口 = current（存量构成归因）')
+assert.equal(exst.explain.report.bySession.dominant.key, 'taskA', '会话主因 = taskA（占比最高任务）')
+assert.equal(exst.explain.report.byRoute.dominant.key, 'deepseek/deepseek-chat', '路由主因 = deepseek/deepseek-chat')
+const exsum = exCtx.costGuard.summary()
+assert.ok(exsum.includes('根因解释'), '摘要含成本根因解释行')
+// 工具可执行：取窗口 + 叙事 + JSON 安全
+const exTool = exTools.find((t) => t.name === 'cost_guard_explain')
+const exOut = await exTool.execute({ mode: 'delta' })
+assert.ok(exOut.summary && exOut.summary.includes('成本'), '工具输出根因摘要')
+assert.ok(Array.isArray(exOut.narrative) && exOut.narrative.length > 0, '工具输出中文叙事行')
+assert.ok(exOut.report.bySession.dominant.key === 'taskA', '工具报表与会话主因一致')
+JSON.stringify(exOut) // 必须可序列化（无 NaN/undefined 键污染）
+ok('12.1 成本根因解释：双视角主因 + 摘要行 + delta 叙事输出 + JSON 安全')
+// 零回归锚点：explain 未配置时不注册工具、无根因段
+const noexCtx = new Context()
+const noexTools = []
+noexCtx.tools = { register: (def) => noexTools.push(def) }
+apply(noexCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {},
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+})
+assert.ok(!noexTools.some((t) => t.name === 'cost_guard_explain'), '未启用 explain：不注册解释工具（零回归）')
+assert.equal(noexCtx.costGuard.status().explain, undefined, '未启用 explain：状态无根因段（零回归）')
+assert.ok(!noexCtx.costGuard.summary().includes('根因解释'), '摘要不含根因解释行（零回归）')
+ok('12.2 未启用 explain：输出与 0.13.0 完全一致（无工具 / 无根因段）')
+
+// ---- 13. 告警根因解释（0.15.0） ----
+section('告警根因解释（Guard 告警追加「为什么超」中文叙事 + onViolation 接入）')
+const atCtx = new Context()
+const atTools = []
+atCtx.tools = { register: (def) => atTools.push(def) }
+apply(atCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {},
+  budgets: { total: { limit: 3.6 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+  explain: { enabled: true, alert: { enabled: true } },
+})
+// 制造消费：taskA 占大头（会话主因）、taskB 小头
+atCtx.emit(
+  'session/event',
+  { get id() { return 'taskA' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { provider: 'deepseek', model: 'deepseek-chat', usage: { inputTokens: 900_000, outputTokens: 100_000 } },
+  },
+)
+atCtx.emit(
+  'session/event',
+  { get id() { return 'taskB' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { provider: 'deepseek', model: 'deepseek-flash', usage: { inputTokens: 100_000, outputTokens: 10_000 } },
+  },
+)
+// 真实触发 pre-step：guard warn → onViolation → 告警根因叙事（不抛错）
+const atNext = () => Promise.resolve({ kind: 'enter', messages: [] })
+atCtx.emit(
+  'agent/pre-step',
+  { agent: { cancel() {} }, messages: [], turn: 0, step: 1, signal: new AbortController().signal },
+  atNext,
+)
+const atst = atCtx.costGuard.status()
+assert.equal(atst.guard.action, 'warn', 'explain.alert.enabled：预算达 80%+ 告警水位 → guard 决策 warn 且不熔断')
+assert.ok(atst.explain, '告警触发时状态面板仍含根因段')
+assert.equal(atst.explain.report.bySession.dominant.key, 'taskA', '告警叙事沿用会话主因 taskA')
+ok('13.1 告警根因解释：onViolation 接入告警链路（warn 决策不熔断 + 根因段保留 + 叙事合成无异常）')
+// 零回归锚点：仅 explain 未配置 alert 时，告警行为与 0.14.0 完全一致
+const noalCtx = new Context()
+const noalTools = []
+noalCtx.tools = { register: (def) => noalTools.push(def) }
+apply(noalCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {},
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+  explain: { enabled: true },
+})
+noalCtx.emit(
+  'session/event',
+  { get id() { return 'x1' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { provider: 'deepseek', model: 'deepseek-chat', usage: { inputTokens: 100_000, outputTokens: 10_000 } },
+  },
+)
+assert.ok(noalCtx.costGuard.status().explain, '未配置 alert：仍启用成本根因解释段（零回归）')
+ok('13.2 未配置 alert：输出与 0.14.0 完全一致（无告警根因追加）')
+
+// ---- 14. 多租户成本解释视图（0.16.0） ----
+section('多租户成本解释视图（租户聚合 + 租户间归因 + 租户内两级证据链 + 中文叙事）')
+const tnCtx = new Context()
+const tnTools = []
+tnCtx.tools = { register: (def) => tnTools.push(def) }
+apply(tnCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {},
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+  tenant: {
+    enabled: true,
+    resolve: {
+      prefix: { 'team-a/': 'team-a', 'team-b/': 'team-b', 'team-c/': 'team-c' },
+    },
+  },
+})
+// 制造消费：team-a/s1 大头（租户主因 + 会话主因）、team-a/s2 小头、team-b/s3 中头、无前缀兜底 default
+const flows = [
+  ['team-a/s1', 800_000, 200_000],
+  ['team-a/s2', 100_000, 20_000],
+  ['team-b/s3', 300_000, 60_000],
+  ['no-prefix/x1', 50_000, 5_000],
+]
+for (const [sid, inputTokens, outputTokens] of flows) {
+  tnCtx.emit(
+    'session/event',
+    { get id() { return sid } },
+    {
+      type: 'assistant/message',
+      time: Date.now(),
+      data: { provider: 'deepseek', model: 'deepseek-chat', usage: { inputTokens, outputTokens } },
+    },
+  )
+}
+const tnToolsNames = tnTools.map((t) => t.name).sort()
+assert.deepEqual(tnToolsNames, ['cost_guard_status', 'cost_guard_tenant'], 'tenant.enabled：注册 status + tenant 两个只读工具')
+const tnst1 = tnCtx.costGuard.status()
+assert.equal(tnst1.tenant.window, 'current', '首查 current：存量构成归因')
+assert.equal(tnst1.tenant.report.tenantCount, 3, '租户聚合：3 个租户（team-a / team-b / default）')
+assert.equal(tnst1.tenant.report.byTenant.dominant.key, 'team-a', '租户间归因：主因租户 team-a')
+const tnTop = tnst1.tenant.report.details.find((d) => d.tenantId === 'team-a')
+assert.equal(tnTop.topSessions[0].key, 'team-a/s1', '租户内两级证据链：team-a 主因会话 s1')
+const tnSum1 = tnCtx.costGuard.summary()
+assert.ok(tnSum1.includes('多租户视图'), '摘要含多租户视图行')
+assert.ok(tnSum1.includes('主因租户 team-a'), '摘要含主因租户行')
+ok('14.1 多租户视图：租户解析/聚合/租户间归因/租户内证据链/摘要行全通')
+// 工具 JSON 安全调用 + 增量归因双模式
+const tnTool = tnTools.find((t) => t.name === 'cost_guard_tenant')
+assert.ok(tnTool, 'cost_guard_tenant 工具已注册')
+const tnReportCall = await tnTool.execute({ mode: 'current' })
+assert.equal(tnReportCall.window, 'current', '工具 current 模式返回存量报表')
+assert.equal(tnReportCall.report.byTenant.dominant.key, 'team-a', '工具报表主因租户 team-a')
+const tnDelta = await tnTool.execute({ mode: 'delta' })
+assert.equal(tnDelta.window, 'current', '首次 delta 无基线：退化为存量归因并沉淀基线')
+assert.equal(tnDelta.report.deltaCost, tnst1.tenant.report.totalCost, '无基线退化：Δ=全部当前成本（相对空基线）')
+// 快照新增 team-c 后 delta 归因
+tnCtx.emit(
+  'session/event',
+  { get id() { return 'team-c/s4' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { provider: 'deepseek', model: 'deepseek-chat', usage: { inputTokens: 500_000, outputTokens: 100_000 } },
+  },
+)
+const tnDelta2 = await tnTool.execute({ mode: 'delta' })
+assert.equal(tnDelta2.window, 'delta', '二次 delta：与上次查询基线增量归因')
+assert.equal(tnDelta2.report.deltaCost > 0, true, '快照变化后 delta 归因：Δ>0')
+assert.equal(tnDelta2.report.byTenant.dominant.key, 'team-c', '增量归因：主因租户切到新增的 team-c')
+ok('14.2 cost_guard_tenant 工具：current/delta 双模式 + 基线增量归因 + JSON 安全输出')
+// 零回归锚点：未配置 tenant 时与 0.15.0 完全一致
+const notnCtx = new Context()
+const notnTools = []
+notnCtx.tools = { register: (def) => notnTools.push(def) }
+apply(notnCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {},
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+})
+notnCtx.emit(
+  'session/event',
+  { get id() { return 'x1' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { provider: 'deepseek', model: 'deepseek-chat', usage: { inputTokens: 100_000, outputTokens: 10_000 } },
+  },
+)
+assert.ok(!notnTools.some((t) => t.name === 'cost_guard_tenant'), '未配置 tenant：不注册租户工具（零回归）')
+assert.equal(notnCtx.costGuard.status().tenant, undefined, '未配置 tenant：状态无 tenant 段（零回归）')
+assert.ok(!notnCtx.costGuard.summary().includes('多租户视图'), '摘要不含多租户行（零回归）')
+ok('14.3 未配置 tenant：输出与 0.15.0 完全一致（无工具 / 无 tenant 段 / 无多租户行）')
+// ---- 15. 推理成本专项治理（0.17.0） ----
+section('推理成本专项治理（思考税账本 + 按路由归因 + 独立推理税预算水位 + 中文叙事）')
+const rtxCtx = new Context()
+const rtxTools = []
+rtxCtx.tools = { register: (def) => rtxTools.push(def) }
+apply(rtxCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  // 推理模型不在官方注册表，配置用户输出价覆盖使其有价可估（4 元/百万输入、8 元/百万输出）
+  pricing: { 'deepseek/deepseek-reasoner': { inputPerMillion: 4, cacheReadPerMillion: 1, outputPerMillion: 8 } },
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+  reasoningTax: {
+    enabled: true,
+    budget: { limit: 0.02, warnAt: 0.8, hardAt: 1 },
+  },
+})
+// 制造带推理 token 的调用：deepseek-reasoner 两条（推理远大于可见输出）+ 普通模型少量推理
+const rtxFlows = [
+  ['r/s1', 'deepseek', 'deepseek-reasoner', 8_000, 400, 200_000],
+  ['r/s2', 'deepseek', 'deepseek-reasoner', 4_000, 200, 100_000],
+  ['r/s3', 'deepseek', 'deepseek-chat', 0, 10_000, 0],
+]
+for (const [sid, provider, model, inputTokens, outputTokens, reasoningTokens] of rtxFlows) {
+  rtxCtx.emit(
+    'session/event',
+    { get id() { return sid } },
+    {
+      type: 'assistant/message',
+      time: Date.now(),
+      data: { provider, model, usage: { inputTokens, outputTokens, reasoningTokens } },
+    },
+  )
+}
+const rtxToolsNames = rtxTools.map((t) => t.name).sort()
+assert.deepEqual(rtxToolsNames, ['cost_guard_reasoning', 'cost_guard_status'], 'reasoningTax.enabled：注册 status + reasoning 两个只读工具')
+const rtxst1 = rtxCtx.costGuard.status()
+assert.equal(rtxst1.reasoningTax.window, 'current', '思考税面板 current：存量构成归因')
+assert.equal(rtxst1.reasoningTax.report.totalReasoningTokens, 300_000, '推理 token 聚合：30 万（两条 reasoner 推理之和）')
+assert.equal(rtxst1.reasoningTax.report.totalOutputTokens, 600, '可见输出聚合：600（reasoner 输出之和）')
+assert.equal(rtxst1.reasoningTax.report.dominant.route, 'deepseek/deepseek-reasoner', '主因路由 reasoner')
+assert.equal(rtxst1.reasoningTax.report.budget.level, 'block', '推理税预算水位：税成本超限 -> block')
+const rtxSum1 = rtxCtx.costGuard.summary()
+assert.ok(rtxSum1.includes('推理税治理'), '摘要含推理税治理行')
+assert.ok(rtxSum1.includes('主因路由 deepseek/deepseek-reasoner'), '摘要含主因路由')
+ok('15.1 推理税面板：推理 token 聚合 + 按路由主因 + 独立预算水位 + 摘要行')
+const rtxTool = rtxTools.find((t) => t.name === 'cost_guard_reasoning')
+const rtxOut = await rtxTool.execute({})
+assert.equal(rtxOut.window, 'current', '工具 current 归因')
+assert.equal(rtxOut.report.byRoute.length, 1, '按路由归因：仅 reasoner 有推理 token')
+assert.ok(Array.isArray(rtxOut.narrative) && rtxOut.narrative.length > 0, '工具输出中文叙事')
+assert.ok(!JSON.stringify(rtxOut).includes('NaN'), '工具 JSON 安全（无 NaN）')
+assert.ok(String(rtxOut.summary).includes('主因路由'), '工具 summary 含主因路由')
+ok('15.2 cost_guard_reasoning 工具：思考税报表 + 中文叙事 + JSON 安全')
+// 零回归锚点：未配置 reasoningTax 时与 0.16.0 完全一致
+const nordxCtx = new Context()
+const nordxTools = []
+nordxCtx.tools = { register: (def) => nordxTools.push(def) }
+apply(nordxCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {},
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+})
+nordxCtx.emit(
+  'session/event',
+  { get id() { return 'x1' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { provider: 'deepseek', model: 'deepseek-reasoner', usage: { inputTokens: 100_000, outputTokens: 10_000, reasoningTokens: 50_000 } },
+  },
+)
+assert.ok(!nordxTools.some((t) => t.name === 'cost_guard_reasoning'), '未配置 reasoningTax：不注册推理税工具（零回归）')
+assert.equal(nordxCtx.costGuard.status().reasoningTax, undefined, '未配置 reasoningTax：状态无 reasoningTax 段（零回归）')
+assert.ok(!nordxCtx.costGuard.summary().includes('推理税治理'), '摘要不含推理税行（零回归）')
+ok('15.3 未配置 reasoningTax：输出与 0.16.0 完全一致（无工具 / 无段 / 无行）')
+
+// ---- 16. 多维思考税审计（0.18.0） ----
+section('多维思考税审计（会话 Top N + 时间热力桶双切片 + 中文叙事 + 只读工具）')
+const rgbCtx = new Context()
+const rgbTools = []
+rgbCtx.tools = { register: (def) => rgbTools.push(def) }
+apply(rgbCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: { 'deepseek/deepseek-reasoner': { inputPerMillion: 4, cacheReadPerMillion: 1, outputPerMillion: 8 } },
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+  reasoningTaxAudit: {
+    enabled: true,
+    sessionTopN: 3,
+    bucketMinutes: 60,
+    heatBuckets: 24,
+  },
+})
+// 制造带会话 id 的推理调用：sess-a 与 sess-b 两个会话、两个时间桶（相隔 2 小时）
+const nowBase = Date.now()
+const rgbFlows = [
+  ['sess-a', 'deepseek', 'deepseek-reasoner', 8_000, 400, 200_000, nowBase],
+  ['sess-a', 'deepseek', 'deepseek-reasoner', 4_000, 200, 100_000, nowBase],
+  ['sess-b', 'deepseek', 'deepseek-reasoner', 2_000, 100, 50_000, nowBase + 2 * 3_600_000],
+]
+for (const [sid, provider, model, inputTokens, outputTokens, reasoningTokens, time] of rgbFlows) {
+  rgbCtx.emit(
+    'session/event',
+    { get id() { return sid } },
+    {
+      type: 'assistant/message',
+      time,
+      data: { provider, model, usage: { inputTokens, outputTokens, reasoningTokens } },
+    },
+  )
+}
+const rgbToolsNames = rgbTools.map((t) => t.name).sort()
+assert.deepEqual(rgbToolsNames, ['cost_guard_reasoning_audit', 'cost_guard_status'], 'reasoningTaxAudit.enabled：注册 status + reasoning_audit 两个只读工具')
+const rgbst1 = rgbCtx.costGuard.status()
+assert.equal(rgbst1.reasoningTaxAudit.window, 'current', '多维审计面板 current：存量构成归因')
+assert.equal(rgbst1.reasoningTaxAudit.report.totalReasoningTokens, 350_000, '推理 token 聚合：35 万（三条 reasoner 推理之和）')
+assert.equal(rgbst1.reasoningTaxAudit.report.totalOutputTokens, 700, '可见输出聚合：700（reasoner 输出之和）')
+// 会话切片：sess-a 税成本最高（300000×8/1e6=2.4），排首位
+assert.equal(rgbst1.reasoningTaxAudit.report.sessions.length, 2, '会话切片：sess-a + sess-b')
+assert.equal(rgbst1.reasoningTaxAudit.report.sessions[0].key, 'sess-a', '主因会话 sess-a（税成本最高）')
+assert.ok(Math.abs(rgbst1.reasoningTaxAudit.report.sessions[0].taxCost - 2.4) < 1e-9, '主因会话税成本 ≈ 300000×8/1e6 = 2.4')
+// 热力桶：两桶（now 桶与 +2h 桶），首个为峰值桶
+assert.equal(rgbst1.reasoningTaxAudit.report.heat.length, 2, '热力桶：两个时间桶')
+assert.equal(rgbst1.reasoningTaxAudit.report.dominantBucket.reasoningTokens, 300_000, '热力峰值桶 = 首桶（30 万）')
+const rgbSum1 = rgbCtx.costGuard.summary()
+assert.ok(rgbSum1.includes('推理税审计'), '摘要含多维审计行')
+assert.ok(rgbSum1.includes('主因会话 sess-a'), '摘要含主因会话')
+ok('16.1 多维审计面板：会话 Top N + 时间热力桶双切片 + 主因会话/峰值桶 + 摘要行')
+const rgbTool = rgbTools.find((t) => t.name === 'cost_guard_reasoning_audit')
+const rgbOut = await rgbTool.execute({})
+assert.equal(rgbOut.window, 'current', '工具 current 归因')
+assert.equal(rgbOut.report.sessions.length, 2, '工具报表会话排行')
+assert.ok(Array.isArray(rgbOut.narrative) && rgbOut.narrative.length > 0, '工具输出中文叙事')
+assert.ok(typeof rgbOut.explanation === 'string' && rgbOut.explanation.length > 0, '工具输出 explanation 文本')
+assert.ok(!JSON.stringify(rgbOut).includes('NaN'), '工具 JSON 安全（无 NaN）')
+assert.ok(String(rgbOut.summary).includes('主因会话'), '工具 summary 含主因会话')
+ok('16.2 cost_guard_reasoning_audit 工具：会话/热力双切片报表 + 中文叙事 + JSON 安全')
+// 零回归锚点：未配置 reasoningTaxAudit 时与 0.17.0 完全一致
+const norbgCtx = new Context()
+const norbgTools = []
+norbgCtx.tools = { register: (def) => norbgTools.push(def) }
+apply(norbgCtx, {
+  enabled: true,
+  mode: 'warn',
+  cancelOnBlock: true,
+  tzOffsetMin: 480,
+  pricing: {},
+  budgets: { total: { limit: 1000 } },
+  fallbackProvider: 'deepseek',
+  fallbackModel: 'deepseek-chat',
+  enableTool: true,
+})
+norbgCtx.emit(
+  'session/event',
+  { get id() { return 'x1' } },
+  {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: { provider: 'deepseek', model: 'deepseek-reasoner', usage: { inputTokens: 100_000, outputTokens: 10_000, reasoningTokens: 50_000 } },
+  },
+)
+assert.ok(!norbgTools.some((t) => t.name === 'cost_guard_reasoning_audit'), '未配置 reasoningTaxAudit：不注册审计工具（零回归）')
+assert.equal(norbgCtx.costGuard.status().reasoningTaxAudit, undefined, '未配置 reasoningTaxAudit：状态无审计段（零回归）')
+assert.ok(!norbgCtx.costGuard.summary().includes('推理税审计'), '摘要不含审计行（零回归）')
+ok('16.3 未配置 reasoningTaxAudit：输出与 0.17.0 完全一致（无工具 / 无段 / 无行）')
+
 console.log(`\n[${++step}] 冒烟通过 ✓`)
-console.log('dsh-cost-guard@0.6.0 lib 产物在真实 Node 环境运行正常（实时计量 + 峰谷计费 + 预测式治理 + 自适应调节 + 效率洞察 + 缓存维度计量）')
+console.log('dsh-cost-guard@0.18.0 lib 产物在真实 Node 环境运行正常（实时计量 + 峰谷计费 + 预测式治理 + 自适应调节 + 效率洞察 + 缓存维度计量 + 官方计价引擎 + 成本根因解释 + 告警根因解释 + 多租户成本解释视图 + 推理成本专项治理 + 多维思考税审计）')

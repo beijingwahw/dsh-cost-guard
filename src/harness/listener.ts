@@ -10,7 +10,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
-import type { TokenUsageLike, TimeBand, UsageEntry } from '../core/types.js'
+import type { TokenUsageLike, TimeBand, ModelPrice, UsageEntry } from '../core/types.js'
 import { BASE_BAND } from '../core/types.js'
 import {
   computeCost,
@@ -23,6 +23,8 @@ import {
   type BandPriceTable,
   type PricingTable,
 } from '../core/pricing.js'
+import { officialBandForEpochOf, officialEntryPrice } from '../core/official-pricing.js'
+import type { CacheBand } from '../core/cache-types.js'
 import type { Meter } from '../core/meter.js'
 import type { WindowMeter } from '../core/meter.js'
 
@@ -36,29 +38,34 @@ export interface ParsedSessionEvent {
   model?: string
 }
 
+/** DSH SessionEvent 外围可携带的 data 字段（事件载荷；类型未在 dsh-session 中建模）。 */
+interface EventWithData {
+  data?: unknown
+}
+
 /** 从 DSH 的 SessionEvent 提取我们需要的字段（宽容解析，字段缺失不抛错）。 */
 export function parseSessionEvent(event: SessionEvent & { sessionId?: string }): ParsedSessionEvent {
   const base: ParsedSessionEvent = {
     type: event.type,
     time: event.time,
-    sessionId: event.sessionId,
+    ...(event.sessionId !== undefined ? { sessionId: event.sessionId } : {}),
   }
-  const data = (event as unknown as { data?: unknown }).data
+  const data = (event as EventWithData).data
   if (!data || typeof data !== 'object') return base
 
   const record = data as Record<string, unknown>
 
   // request/header -> 路由
   if (event.type === 'request/header') {
-    const header = record.header as { config?: { provider?: string; model?: string } } | undefined
+    const header = record['header'] as { config?: { provider?: string; model?: string } } | undefined
     const config = header?.config
     if (config?.provider) base.provider = config.provider
     if (config?.model) base.model = config.model
   }
 
-  // assistant/message -> usage
+  // assistant/message -> usage（宽容读取路由：部分宿主把 provider/model 随消息载荷下发）
   if (event.type === 'assistant/message') {
-    const usage = record.usage as TokenUsageLike | undefined
+    const usage = record['usage'] as TokenUsageLike | undefined
     if (usage && typeof usage.inputTokens === 'number') {
       base.usage = {
         inputTokens: usage.inputTokens,
@@ -68,6 +75,10 @@ export function parseSessionEvent(event: SessionEvent & { sessionId?: string }):
         reasoningTokens: usage.reasoningTokens ?? 0,
       }
     }
+    const msgProvider = (record['provider'] as string | undefined) ?? (record['message'] as { provider?: string } | undefined)?.provider
+    const msgModel = (record['model'] as string | undefined) ?? (record['message'] as { model?: string } | undefined)?.model
+    if (msgProvider) base.provider = msgProvider
+    if (msgModel) base.model = msgModel
   }
 
   return base
@@ -79,6 +90,19 @@ export interface BandPricingContext {
   bands?: TimeBand[]
   /** 事件时区偏移（分钟），用于把事件时间换算为本地分钟选带。 */
   tzOffsetMin?: number
+  /**
+   * 官方计价引擎（0.8.0；缺省不启用 = 零回归）。
+   * 启用后：主计量并入官方价目（flash / v4-pro 三通道）、官方峰谷自动挂载
+   * （工作日非节假日 9-12 / 14-18 高峰，其余空闲）、模型名别名归一
+   * （deepseek-v4-flash 等旧名路由到 flash 价）。用户自定义 bands 仍优先于官方峰谷。
+   */
+  official?: {
+    enabled: boolean
+    /** 用户 pricing 覆盖（最终单价，优先于官方价，不随峰谷翻倍）。 */
+    overrides: Record<string, ModelPrice>
+    /** 额外法定节假日（YYYY-MM-DD）；缺省用内置 2026 节假日表。 */
+    holidays?: ReadonlySet<string>
+  }
 }
 
 /** 由解析后的宿主事件构造计价入账条目。 */
@@ -87,6 +111,8 @@ export function toUsageEntry(
   routes: PricingTable,
   fallbackRoute: { provider: string; model: string },
   bandCtx?: BandPricingContext,
+  /** 预构建的带覆盖表（高频路径在装配层构建一次复用；缺省按 bandCtx 构建）。 */
+  prebuiltBandTable?: BandPriceTable,
 ): UsageEntry | undefined {
   if (!parsed.usage || parsed.usage.inputTokens + parsed.usage.outputTokens + (parsed.usage.cacheReadTokens ?? 0) <= 0) {
     return undefined
@@ -100,19 +126,40 @@ export function toUsageEntry(
     outputTokens: parsed.usage.outputTokens,
     cacheReadTokens: parsed.usage.cacheReadTokens ?? 0,
   }
-  // 峰谷选带：按事件发生的本地分钟；无时段配置归 BASE_BAND
+  // 0.10.0：缓存写 token（Anthropic 官方单独计价；其余厂商无写价概念时按 0，零回归）。
+  // 仅用于 cost 折算，不入 UsageEntry.usage（保持 0.9.0 形状与显示口径）。
+  const usageForCost = {
+    ...usage,
+    cacheWriteTokens: parsed.usage.cacheWriteTokens ?? 0,
+  }
+  // 峰谷选带：事件本地时刻；无时段配置归 BASE_BAND
   const tzOffsetMin = bandCtx?.tzOffsetMin ?? 0
   const bands = bandCtx?.bands ?? []
-  const band = bands.length > 0 ? bandIdForEpoch(bands, parsed.time, tzOffsetMin) : BASE_BAND
-  const bandTable: BandPriceTable = buildBandPriceTable(bands)
-  const { price } = bands.length > 0 ? priceForAt(routes, bandTable, route, band) : priceFor(routes, route)
+  // 用户显式配置的时段始终优先（官方引擎不越过用户自定义计费规则）
+  const official = bandCtx?.official
+  let band: string
+  let price: ModelPrice
+  if (bands.length > 0) {
+    band = bandIdForEpoch(bands, parsed.time, tzOffsetMin)
+    const bandTable: BandPriceTable = prebuiltBandTable ?? buildBandPriceTable(bands)
+    price = priceForAt(routes, bandTable, route, band).price
+  } else if (official?.enabled === true) {
+    // 官方峰谷自动挂载：无用户时段时按官方规则选带（'peak' / 'idle'）；
+    // 0.11.0 band 按模型峰谷策略判定（dsn-peak=DeepSeek 官方、baichuan-tier=百川每日 0-8/8-24、flat 恒定价）
+    band = officialBandForEpochOf(route.model, parsed.time, tzOffsetMin, official.holidays)
+    const resolved = officialEntryPrice(official.overrides, route, band as CacheBand, routes)
+    price = resolved.price
+  } else {
+    band = BASE_BAND
+    price = priceFor(routes, route).price
+  }
   return {
     time: parsed.time,
     route,
     usage,
     cacheReadTokens: usage.cacheReadTokens,
     reasoningTokens: parsed.usage.reasoningTokens ?? 0,
-    cost: computeCost(price, usage),
+    cost: computeCost(price, usageForCost),
     credits: computeCredits(price, usage),
     totalTokens: billedTokens(usage),
     band,
@@ -133,12 +180,21 @@ export function attachSessionMeter(
   fallbackRoute: { provider: string; model: string },
   bandCtx?: BandPricingContext,
 ): () => void {
+  // 带覆盖表在装配层构建一次，事件流中复用（避免每次事件重复分配）。
+  const prebuiltBandTable: BandPriceTable = buildBandPriceTable(bandCtx?.bands ?? [])
+  const logger = ctx.logger('cost-guard')
   ctx.on('session/event', (session: Session, event: SessionEvent) => {
-    const parsed = parseSessionEvent({ ...event, sessionId: String(session.id) })
-    const entry = toUsageEntry(parsed, routes, fallbackRoute, bandCtx)
-    if (!entry) return
-    sink.record(entry, parsed.sessionId)
-    sink.recordWindow(entry)
+    try {
+      const parsed = parseSessionEvent({ ...event, sessionId: String(session.id) })
+      const entry = toUsageEntry(parsed, routes, fallbackRoute, bandCtx, prebuiltBandTable)
+      if (!entry) return
+      sink.record(entry, parsed.sessionId)
+      sink.recordWindow(entry)
+    } catch (err) {
+      // 计量是旁路能力：宿主事件链中的异常不得反噬会话主流程。
+      // 记录并跳过本条事件（fail-safe），不吞错也不抛给宿主。
+      logger.warn(`[cost-guard] 计量事件处理失败，已跳过：${err instanceof Error ? err.message : String(err)}`)
+    }
   })
   return () => {
     /* ctx.on 在插件卸载时自动回收 */
@@ -163,7 +219,9 @@ export function attachMeters(
         meter.record(entry, sessionId)
         sampler?.(entry, sessionId)
       },
-      recordWindow: (entry) => windows.record(entry),
+      recordWindow: (entry) => {
+        windows.record(entry)
+      },
     },
     routes,
     fallbackRoute,

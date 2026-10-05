@@ -24,6 +24,19 @@ import {
   type BandPriceTable,
   type PricingTable,
 } from '../core/pricing.js'
+import {
+  officialBandForEpoch,
+  officialEntryPrice,
+  officialProviderOf,
+  officialCurrencyOf,
+  officialPeakPolicyOf,
+  OFFICIAL_IDLE_PRICES,
+  OFFICIAL_MODEL_REGISTRY,
+  PEAK_MULTIPLIER,
+  type OfficialModelStatus,
+  type ReasoningLedger,
+  type ReasoningSummary,
+} from '../core/official-pricing.js'
 import type { CostTrail } from '../core/trail.js'
 import type { MadDetector, SpikeLevel } from '../core/anomaly.js'
 import { buildForecast } from '../core/forecast.js'
@@ -32,6 +45,17 @@ import { requestCostDistribution, routeEfficiency, estimateReplacement } from '.
 import type { GuardHandle } from './guard.js'
 import { buildCachePanel, formatCacheLines } from './cache.js'
 import type { CachePanelPayload } from './cache.js'
+import type { CachePricingEngine } from '../core/cache-pricing.js'
+import type { FrontierRuntime, FrontierPanelPayload } from './frontier.js'
+import { formatFrontierLines } from './frontier.js'
+import type { ExplainRuntime, ExplainPanelPayload } from './explain.js'
+import { formatExplainLines } from './explain.js'
+import type { TenantRuntime, TenantPanelPayload } from './tenant.js'
+import { formatTenantLines } from './tenant.js'
+import type { ReasoningTaxRuntime, ReasoningTaxPanelPayload } from './reasoning-tax.js'
+import { formatReasoningTaxLines } from './reasoning-tax.js'
+import type { ReasoningTaxAuditRuntime, ReasoningTaxAuditPanelPayload } from './reasoning-tax-audit.js'
+import { formatReasoningTaxAuditLines } from './reasoning-tax-audit.js'
 
 /** 单维度消耗：话费（金额）与积分独立。 */
 export interface CostDimension {
@@ -112,6 +136,69 @@ export interface CostStatusPayload {
   }
   /** 缓存维度计量（0.6.0；仅 cache.enabled=true 时存在，缺省 undefined = 零回归）。 */
   cache?: CachePanelPayload
+  /** 官方计价段（0.8.0；仅 officialPricing.enabled=true 时存在，缺省 undefined = 零回归）。 */
+  official?: {
+    enabled: true
+    /** 官方高峰倍数（deepseek dsn-peak 策略：高峰价 = 空闲价 × 2；flat 策略厂商恒定价）。 */
+    peakMultiplier: number
+    /** 当前官方时段（无用户自定义时段时生效；仅 deepseek 模型受时段影响）。 */
+    currentBand: 'peak' | 'idle'
+    /** 官方模型现价目：模型名 -> { idle, peak }（用户覆盖优先；flat 厂商 peak=idle 恒定价）。 */
+    prices: Record<string, { idle: ModelPrice; peak: ModelPrice }>
+    /** 推理 token（思维链）洞察：tokens / 占比 / 成本（按官方空闲输出价估算）。无样本时 null。 */
+    reasoning: ReasoningSummary | null
+    /**
+     * 官方模型注册状态（0.9.0 → 0.10.0 多厂商）：全部官方模型名的
+     * 在售 / 下线路由 / 已停用 / Legacy / 开源状态 + 厂商与币种（供 Agent 迁移与计价决策）。
+     */
+    registry: Array<{
+      model: string
+      status: OfficialModelStatus
+      /** 所属厂商。 */
+      provider: string
+      /** 官方价目币种（CNY=DeepSeek；USD=OpenAI/Anthropic/Google/Mistral）。 */
+      currency: string
+      /** 峰谷策略（dsn-peak=高峰×2；flat=恒定价）。 */
+      peakPolicy: string
+      /** 来源分级（official=官方页直抓；aggregated=公开聚合交叉）。 */
+      sourceLevel: string
+      /** 核对日期（YYYY-MM-DD）。 */
+      verifiedAt: string
+      /** routed：路由目标模型。 */
+      routesTo?: string
+      /** decommissioned：停用日期（YYYY-MM-DD）。 */
+      decommissionedAt?: string
+      /** decommissioned：迁移建议。 */
+      migrateTo?: string
+      /** 附加说明（口径 / 背景 / 来源注记）。 */
+      note?: string
+    }>
+  }
+  /**
+   * 前沿套件（0.12.0；仅 frontier 任一能力启用时存在，缺省 undefined = 零回归）：
+   * FOCUS 成本台账 / OTel GenAI 遥测 / 单位经济学与成本归属 / 成本杠杆洞察。
+   */
+  frontier?: FrontierPanelPayload
+  /**
+   * 成本根因与可解释叙事（0.14.0；仅 explain.enabled=true 时存在，
+   * 缺省 undefined = 零回归）。
+   */
+  explain?: ExplainPanelPayload
+  /**
+   * 多租户成本解释视图（0.16.0；仅 tenant.enabled=true 时存在，
+   * 缺省 undefined = 零回归）。
+   */
+  tenant?: TenantPanelPayload
+  /**
+   * 推理成本专项治理（0.17.0；仅 reasoningTax.enabled=true 时存在，
+   * 缺省 undefined = 零回归）。
+   */
+  reasoningTax?: ReasoningTaxPanelPayload
+  /**
+   * 多维思考税审计（0.18.0；仅 reasoningTaxAudit.enabled=true 时存在，
+   * 缺省 undefined = 零回归）。
+   */
+  reasoningTaxAudit?: ReasoningTaxAuditPanelPayload
 }
 
 /** buildCostStatus 的可选上下文：峰谷时段 + 基准价表 + 时区与时钟。 */
@@ -129,7 +216,32 @@ export interface BandStatusContext {
   /** 单请求成本样本（0.5.0；成本分布统计），提供 detector.window() 即可。 */
   costSamples?: { window: () => number[] }
   /** 缓存维度计量（0.6.0；仅 cache.enabled=true 时注入，缺省不输出缓存段）。 */
-  cache?: { metrics: import('../core/cache-metrics.js').CacheMetrics; hint: import('../core/cache-hint.js').CacheHintDetector }
+  cache?: {
+    metrics: import('../core/cache-metrics.js').CacheMetrics
+    hint: import('../core/cache-hint.js').CacheHintDetector
+    /** 三通道定价引擎（0.12.0 前沿杠杆计算需要）。 */
+    pricing: CachePricingEngine
+  }
+  /** 官方计价引擎（0.8.0；仅 officialPricing.enabled=true 时注入，缺省不输出官方段）。 */
+  official?: {
+    enabled: boolean
+    /** 用户 pricing 覆盖（最终单价优先，不随峰谷翻倍）。 */
+    overrides: Record<string, ModelPrice>
+    /** 额外法定节假日（YYYY-MM-DD）；缺省用内置 2026 节假日表。 */
+    holidays?: ReadonlySet<string>
+    /** 推理 token 账本（由主计量 sampler 喂入）。 */
+    reasoning?: ReasoningLedger
+  }
+  /** 前沿套件（0.12.0；仅 frontier 任一能力启用时注入，缺省不输出前沿段）。 */
+  frontier?: FrontierRuntime
+  /** 成本根因与可解释叙事（0.14.0；仅 explain.enabled=true 时注入）。 */
+  explain?: ExplainRuntime
+  /** 多租户成本解释视图（0.16.0；仅 tenant.enabled=true 时注入，缺省不输出租户段）。 */
+  tenant?: TenantRuntime
+  /** 推理成本专项治理（0.17.0；仅 reasoningTax.enabled=true 时注入，缺省不输出思考税段）。 */
+  reasoningTax?: ReasoningTaxRuntime
+  /** 多维思考税审计（0.18.0；仅 reasoningTaxAudit.enabled=true 时注入，缺省不输出审计段）。 */
+  reasoningTaxAudit?: ReasoningTaxAuditRuntime
 }
 
 /** 构造路由查询对象：'provider/model' 或裸 'model'。 */
@@ -139,6 +251,58 @@ function routeFromKey(key: string): { provider: string; model: string } {
     return { provider: key.slice(0, idx), model: key.slice(idx + 1) }
   }
   return { provider: 'deepseek', model: key }
+}
+
+/**
+ * CostStatusPayload -> 工具 schema 契约的 JSON 记录：
+ * 快照本体是纯 JSON 结构（number/string/boolean/null/数组/Record），
+ * 这里做受控投影：过滤 undefined（未启用模块不输出该键），
+ * 并对非法 JSON 值（NaN/Infinity/循环引用）抛可识别错误而非静默吞掉。
+ */
+export function toToolJson(status: CostStatusPayload): Record<string, JsonValue> {
+  const out: Record<string, JsonValue> = {}
+  for (const [k, v] of Object.entries(status)) {
+    if (v === undefined) continue
+    if (!isJsonValueSafe(v)) throw new Error(`[cost-guard] 状态字段 "${k}" 不是无损 JSON 值，拒绝输出`)
+    out[k] = v
+  }
+  return out
+}
+
+/** 无损 JSON 值守卫（与 dsh-session 的 JsonValue 语义一致：无 NaN/Infinity/-0/循环引用）。 */
+function isJsonValueSafe(v: unknown): v is JsonValue {
+  if (v === null || typeof v === 'string' || typeof v === 'boolean') return true
+  if (typeof v === 'number') return Number.isFinite(v) && !Object.is(v, -0)
+  if (Array.isArray(v)) return v.every(isJsonValueSafe)
+  if (typeof v === 'object') {
+    // 循环引用守卫：对象值递归前先确认后继可达深度，防栈溢出
+    return depthSafe(v, new Set())
+  }
+  return false
+}
+
+/** 对象逐层递归校验（带已访问集，拒绝循环引用）；数组由上面的 every 分支处理。 */
+function depthSafe(v: object, seen: Set<object>): boolean {
+  if (seen.has(v)) return false
+  seen.add(v)
+  for (const value of Object.values(v) as unknown[]) {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') continue
+    if (typeof value === 'number') {
+      // 注意：不能用 value === -0 判断，0 === -0 为 true，会把合法 0 判非法
+      if (!Number.isFinite(value) || Object.is(value, -0)) return false
+      continue
+    }
+    if (Array.isArray(value)) {
+      if (!value.every(isJsonValueSafe)) return false
+      continue
+    }
+    if (typeof value === 'object') {
+      if (!depthSafe(value, seen)) return false
+      continue
+    }
+    return false
+  }
+  return true
 }
 
 /** 汇总状态（JSON 安全，供工具与面板共用）。 */
@@ -166,15 +330,21 @@ export function buildCostStatus(
   }
   const decision = guard.inspect()
 
-  // 峰谷实时状态
+  // 峰谷实时状态：用户自定义时段优先；否则官方计价引擎按官方规则选带（'peak'/'idle'）
   const bands = ctx?.bands ?? []
   const tzOffsetMin = ctx?.tzOffsetMin ?? 0
+  const officialCtx = ctx?.official
+  const officialEnabled = officialCtx?.enabled === true
   const at = (ctx?.now ?? Date.now)()
-  const bandId = bands.length > 0 ? bandIdForEpoch(bands, at, tzOffsetMin) : BASE_BAND
+  const bandId = bands.length > 0
+    ? bandIdForEpoch(bands, at, tzOffsetMin)
+    : officialEnabled
+      ? officialBandForEpoch(at, tzOffsetMin, officialCtx?.holidays)
+      : BASE_BAND
   const bandDef = bands.find((b) => b.id === bandId) ?? null
   const bandTable: BandPriceTable = buildBandPriceTable(bands)
 
-  // 当前时段各模型生效单价：基准表键 ∪ 当前带覆盖键
+  // 当前时段各模型生效单价：基准表键 ∪ 当前带覆盖键；官方模式合并官方模型两档价
   const priceKeys = new Set<string>()
   if (ctx?.baseline) for (const k of Object.keys(ctx.baseline)) priceKeys.add(k)
   const curBandPrices = bandTable[bandId]
@@ -186,6 +356,43 @@ export function buildCostStatus(
     // 仅展示有明确价格的键；未显式配置且命中兜底的键按兜底价展示也可（保守）。
     if (price) activePrices[k] = { ...price }
   }
+
+  // 官方计价段（0.8.0）：官方模型两级价目（用户覆盖优先，高峰自动 ×2）+ 推理 token 洞察
+  const official = officialEnabled
+    ? ((): NonNullable<CostStatusPayload['official']> => {
+        const overrides = officialCtx?.overrides ?? {}
+        const prices: NonNullable<CostStatusPayload['official']>['prices'] = {}
+        for (const model of Object.keys(OFFICIAL_IDLE_PRICES)) {
+          // 0.10.0：按注册表厂商构造路由（provider 不再写死 deepseek），用户覆盖键可精确到厂商/模型
+          const route = { provider: officialProviderOf(model) ?? 'deepseek', model }
+          prices[model] = {
+            idle: officialEntryPrice(overrides, route, 'idle', baseline).price,
+            peak: officialEntryPrice(overrides, route, 'peak', baseline).price,
+          }
+        }
+        return {
+          enabled: true,
+          peakMultiplier: PEAK_MULTIPLIER,
+          currentBand: bandId === 'peak' ? 'peak' : 'idle',
+          prices,
+          reasoning: officialCtx?.reasoning?.summary() ?? null,
+          registry: Object.entries(OFFICIAL_MODEL_REGISTRY).map(([model, meta]) => ({
+            model,
+            status: meta.status,
+            provider: meta.provider,
+            currency: meta.currency,
+            peakPolicy: meta.peakPolicy,
+            sourceLevel: meta.sourceLevel,
+            verifiedAt: meta.verifiedAt,
+            // exactOptionalPropertyTypes：仅当官方元数据实际携带可选字段时才写出对应键（缺键与 undefined 键序列化等价，零回归）。
+            ...(meta.routesTo !== undefined ? { routesTo: meta.routesTo } : {}),
+            ...(meta.decommissionedAt !== undefined ? { decommissionedAt: meta.decommissionedAt } : {}),
+            ...(meta.migrateTo !== undefined ? { migrateTo: meta.migrateTo } : {}),
+            ...(meta.note !== undefined ? { note: meta.note } : {}),
+          })),
+        }
+      })()
+    : undefined
 
   const bandTotals: CostStatusPayload['bandTotals'] = {}
   for (const [k, b] of Object.entries(meter.bandTotals())) {
@@ -224,7 +431,7 @@ export function buildCostStatus(
         }
         const predictive = (decision.predictive ?? []).map((p) => ({
           kind: p.kind,
-          scope: p.scope,
+          ...(p.scope !== undefined ? { scope: p.scope } : {}),
           level: p.level,
           detail: p.detail,
         }))
@@ -254,7 +461,6 @@ export function buildCostStatus(
     : null
 
   // —— 成本效率洞察（0.5.0）——
-  const baselinePricing = ctx?.baseline ?? {}
   const effRoutes = routeEfficiency(snapshot.routes).map((r) => ({
     route: r.route,
     cost: r.cost,
@@ -263,7 +469,7 @@ export function buildCostStatus(
     requests: r.requests,
   }))
   const dist = ctx?.costSamples ? requestCostDistribution(ctx.costSamples.window()) : undefined
-  const replacement = estimateReplacement(snapshot.routes, baselinePricing).map((r) => ({
+  const replacement = estimateReplacement(snapshot.routes, baseline).map((r) => ({
     from: r.from,
     to: r.to,
     currentCost: r.currentCost,
@@ -280,6 +486,30 @@ export function buildCostStatus(
   // —— 缓存维度计量（0.6.0）——
   const cacheCtx = ctx?.cache
   const cache = cacheCtx ? buildCachePanel(cacheCtx.metrics, cacheCtx.hint) : undefined
+
+  // —— 前沿套件（0.12.0：FOCUS 台账 / OTel 遥测 / 单位经济学 / 成本杠杆）——
+  const frontierCtx = ctx?.frontier
+  const frontier = frontierCtx?.any
+    ? frontierCtx.panel(
+        { sessions: snapshot.sessions, routes: snapshot.routes },
+        baseline,
+        cacheCtx ? { metrics: cacheCtx.metrics, pricing: cacheCtx.pricing } : undefined,
+        tzOffsetMin,
+        ctx?.now ?? Date.now,
+      )
+    : undefined
+
+  // —— 成本根因与可解释叙事（0.14.0；仅 explain.enabled=true 时输出）——
+  const explain = ctx?.explain?.panel()
+
+  // —— 多租户成本解释视图（0.16.0；仅 tenant.enabled=true 时输出）——
+  const tenant = ctx?.tenant?.panel()
+
+  // —— 推理成本专项治理（0.17.0；仅 reasoningTax.enabled=true 时输出）——
+  const reasoningTax = ctx?.reasoningTax?.panel()
+
+  // —— 多维思考税审计（0.18.0；仅 reasoningTaxAudit.enabled=true 时输出）——
+  const reasoningTaxAudit = ctx?.reasoningTaxAudit?.panel()
 
   return {
     total: dimension(total),
@@ -303,7 +533,14 @@ export function buildCostStatus(
     forecast: predict,
     adaptive,
     efficiency,
-    cache,
+    // exactOptionalPropertyTypes：未启用的可选段不写键（undefined 键序列化等价缺键，零回归）。
+    ...(cache !== undefined ? { cache } : {}),
+    ...(official !== undefined ? { official } : {}),
+    ...(frontier !== undefined ? { frontier } : {}),
+    ...(explain !== undefined ? { explain } : {}),
+    ...(tenant !== undefined ? { tenant } : {}),
+    ...(reasoningTax !== undefined ? { reasoningTax } : {}),
+    ...(reasoningTaxAudit !== undefined ? { reasoningTaxAudit } : {}),
   }
 }
 
@@ -328,9 +565,10 @@ export function attachCostTool(
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
       },
-      async execute(): Promise<Record<string, JsonValue>> {
-        // 状态快照本身是纯 JSON 结构，这里显式投影为 JSON 记录以满足工具 schema 契约。
-        return buildCostStatus(meter, windows, evaluator, guard, bandCtx) as unknown as Record<string, JsonValue>
+      execute(): Promise<Record<string, JsonValue>> {
+        // 状态快照本身是纯 JSON 结构（CPU 快照出厂即 JSON 安全），
+        // 这里显式投影为 JSON 记录以满足工具 schema 契约。
+        return Promise.resolve(toToolJson(buildCostStatus(meter, windows, evaluator, guard, bandCtx)))
       },
     }),
   )
@@ -416,6 +654,96 @@ export function formatStatusSummary(status: CostStatusPayload): string {
   // 缓存维度计量（0.6.0；仅启用时输出）
   if (status.cache) {
     for (const line of formatCacheLines(status.cache)) lines.push(line)
+  }
+  // 官方计价段（0.8.0；仅 officialPricing.enabled 时输出）
+  if (status.official) {
+    const bandLabel = status.official.currentBand === 'peak' ? '高峰' : '空闲'
+    lines.push(
+      `  官方计价: 当前${bandLabel}时段 · DeepSeek 高峰=空闲价×${status.official.peakMultiplier}（dsn-peak 策略）；` +
+        `OpenAI/Anthropic/Google/Mistral 官方恒定价（flat 策略，时段不影响价格）`,
+    )
+    // 按厂商分组展示价目（币种随厂商：DeepSeek CNY、其余 USD，不跨币种换算）
+    const byProvider = new Map<string, Array<[string, { idle: ModelPrice; peak: ModelPrice }]>>()
+    for (const [model, p] of Object.entries(status.official.prices)) {
+      const provider = officialProviderOf(model) ?? 'deepseek'
+      const arr = byProvider.get(provider) ?? []
+      arr.push([model, p])
+      byProvider.set(provider, arr)
+    }
+    for (const [provider, list] of [...byProvider.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      const first = list[0]
+      const currency = first !== undefined ? (officialCurrencyOf(first[0]) ?? 'CNY') : 'CNY'
+      const peakPolicy = first !== undefined ? (officialPeakPolicyOf(first[0]) ?? 'dsn-peak') : 'dsn-peak'
+      const policyLabel = peakPolicy === 'flat' ? '恒定价' : '峰谷'
+      for (const [model, p] of list) {
+        const flat = peakPolicy === 'flat'
+        lines.push(
+          `   ｜ ${provider}/${model} (${currency} · ${policyLabel}): 空闲 ${formatCost(p.idle.inputPerMillion)}/${formatCost(p.idle.cacheReadPerMillion)}/${formatCost(p.idle.outputPerMillion)}` +
+            (flat
+              ? `（输入命中/未命中/输出，恒定价）`
+              : ` · 高峰 ${formatCost(p.peak.inputPerMillion)}/${formatCost(p.peak.cacheReadPerMillion)}/${formatCost(p.peak.outputPerMillion)}（输入命中/未命中/输出，每百万tokens）`),
+        )
+      }
+    }
+    const r = status.official.reasoning
+    if (r) {
+      lines.push(
+        `  推理token: ${r.reasoningTokens.toLocaleString()} tokens（占输出 ${(r.share * 100).toFixed(1)}% · 约 ${formatCost(r.cost)}，按官方空闲输出价估算，币种随模型）`,
+      )
+    }
+    // 官方模型注册状态（0.9.0）：在售 / 下线路由 / 已停用 / Legacy / 开源全景（按厂商分组）
+    const reg = status.official.registry
+    if (reg.length > 0) {
+      const byProviderReg = new Map<string, typeof reg>()
+      for (const m of reg) {
+        const arr = byProviderReg.get(m.provider) ?? []
+        arr.push(m)
+        byProviderReg.set(m.provider, arr)
+      }
+      for (const [provider, ms] of [...byProviderReg.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        const active = ms.filter((m) => m.status === 'active').map((m) => m.model).join('、')
+        const legacy = ms.filter((m) => m.status === 'legacy').map((m) => m.model).join('、')
+        const routed = ms.filter((m) => m.status === 'routed')
+        const decommissioned = ms.filter((m) => m.status === 'decommissioned')
+        const oss = ms.filter((m) => m.status === 'oss').map((m) => m.model).join('、')
+        const currency = ms[0]?.currency ?? 'CNY'
+        const routesDesc = routed.length
+          ? ` · 下线路由 ${routed.length} 个：${routed.map((m) => `${m.model}→${m.routesTo ?? '?'}`).join('、')}（按目标模型价）`
+          : ''
+        if (active) lines.push(`  官方模型(${provider}/${currency}): 在售 ${active}${routesDesc}`)
+        if (legacy) lines.push(`  官方模型(${provider}/${currency}): Legacy 在售 ${legacy}`)
+        if (decommissioned.length > 0) {
+          const names = decommissioned.map((m) => m.model).join('、')
+          const migrate = decommissioned[0]?.migrateTo
+          lines.push(
+            migrate
+              ? `  官方停用(${provider}): ${names} 已停用（请求不再可用，迁移至 ${migrate}）`
+              : `  官方停用(${provider}): ${names} 已停用（请求不再可用）`,
+          )
+        }
+        if (oss) lines.push(`  官方模型(${provider}): 开源权重（无官方托管 API 价） ${oss}`)
+      }
+    }
+  }
+  // 前沿套件（0.12.0）
+  if (status.frontier) {
+    for (const line of formatFrontierLines(status.frontier)) lines.push(line)
+  }
+  // 成本根因与可解释叙事（0.14.0；仅 explain.enabled=true 时输出）
+  if (status.explain) {
+    for (const line of formatExplainLines(status.explain)) lines.push(line)
+  }
+  // 多租户成本解释视图（0.16.0；仅 tenant.enabled=true 时输出）
+  if (status.tenant) {
+    for (const line of formatTenantLines(status.tenant)) lines.push(line)
+  }
+  // 推理成本专项治理（0.17.0；仅 reasoningTax.enabled=true 时输出）
+  if (status.reasoningTax) {
+    for (const line of formatReasoningTaxLines(status.reasoningTax)) lines.push(line)
+  }
+  // 多维思考税审计（0.18.0；仅 reasoningTaxAudit.enabled=true 时输出）
+  if (status.reasoningTaxAudit) {
+    for (const line of formatReasoningTaxAuditLines(status.reasoningTaxAudit)) lines.push(line)
   }
   const top = Object.entries(status.routes)
     .sort((a, b) => b[1].cost - a[1].cost)
