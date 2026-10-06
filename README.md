@@ -1,38 +1,29 @@
 # dsh-cost-guard
 
-**DeepSeek Harness 原生「实时成本治理」插件** —— 用量实时计量、多维度预算、熔断防护、成本面板、预测式治理与自适应调节、官方计价深度同步、成本根因解释、多租户成本视图、推理成本专项治理与多维思考税审计，全部在 Harness 进程内完成。
+> **DeepSeek Harness 原生「实时成本治理」插件** —— 逐 token 实时计量、四维预算熔断、预测式治理、自适应调节、官方计价深度同步、缓存维度计量、成本根因解释、多租户成本视图、推理成本专项治理与多维思考税审计，全部在 Harness 进程内完成。
 
-> 市面现有方案（whale-report 等）全是**事后形态**：跑完一轮才出报告，超支发生后才告诉你。`dsh-cost-guard` 是第一款**原生实时治理插件**：在 `agent/pre-step` 阶段拦下超预算的下一步请求，从源头上阻止模型继续烧钱。
->
-> 0.4.0 把「事后治理」升级为**预测式治理（Predictive Governance）**：不止看"现在花了多少"，而是回答"**今天/本月会花多少、预算何时耗完、这一发请求会不会烧穿、你是不是遇到了成本尖峰**"——在超支发生之前拦截，而非之后追责。
->
-> 0.5.0 再进一步 —— **自适应调节（Adaptive Governance）**：把预算从「静态配额」升级为「会自我调节的额度」。它是成本治理类插件中首个把**月度→日额度动态派生、消费速率背压动态水位、跨周期结转**与预算决策闭环打通的产品级实现：花得快就自动收紧今天的额度、花得稳就留给你更多空间，上个月省下来的变成下个月可用的池子；同时新增**成本效率洞察（Cost Efficiency Intelligence）**，回答"花得值不值"——每千输出 token 成本、单请求成本分布（P50/P95/Max 长尾识别）与路由替代节约估算，把省钱建议直接给出。
->
-> 0.6.0 补齐成本治理最大的结构性杠杆 —— **缓存维度计量（Cache Metering）**：DeepSeek 三通道计费下，缓存命中与未命中价差高达 30–50 倍（flash 空闲 0.02 元 vs 1.00 元/百万 Token），而此前所有输入都按未命中价计费。0.6.0 精确解析每次请求的缓存命中 Token，按 **三通道（命中/未命中/输出）× 高峰/空闲** 官方口径定价，输出 **Token 加权命中率、缓存收益金额（相对全未命中基线）与可优化前缀提示**——回答"优化前缀还能省多少钱"；默认关闭、未启用时行为与 0.5.0 完全一致。
->
-> 0.8.0 把计价基准做扎实 —— **官方计价引擎（Official Pricing Engine）**：面向 DeepSeek 官方实际计价规则做**最准确表达**。主计量与缓存计量统一挂载官方价目（2026-09-10 生效：flash 空闲 命中 0.02 / 未命中 1.00 / 输出 4.00 元/M、v4-pro 空闲 0.15 / 4.50 / 13.50 元/M，高峰 ×2），官方峰谷时段（北京时间周一~周五**非法定节假日** 9:00-12:00 / 14:00-18:00，2026 节假日表内置）自动挂载主计量，downlevel 模型名别名归一不再落兜底最贵档，推理 token 按官方输出价独立计量；默认关闭、未启用时行为与 0.7.0 完全一致。
->
-> 0.9.0 把官方计价同步做深做全 —— **全模型官方计价深度同步（Full-Model Official Pricing Sync）**：官方模型注册表（`OFFICIAL_MODEL_REGISTRY`）登记 DeepSeek 官方**全部模型**的三状态——在售（active，官方价目）、下线路由（routed，归一现行模型价）、已停用（decommissioned，停用日期 + 迁移建议），价目与别名由注册表**单一事实源**派生（覆盖范围从 2 个在售模型扩展为官方全部模型），摘要与 `cost_guard_status` 输出官方模型状态全景；已停用模型取价回落内置/兜底，未启用时行为与 0.8.0 完全一致（零回归）。
->
-> 0.10.0 把官方计价同步从 DeepSeek 一家扩展到**全球主流模型** —— **多厂商官方计价深度同步（Multi-Provider Official Pricing Sync）**：注册表新增 `provider / currency / peakPolicy / sourceLevel / verifiedAt` 五维元数据，登记 **OpenAI GPT（8 条）、Anthropic Claude（13 条，含缓存读价+写价）、Google Gemini（10 条）、Mistral（6 条）、Meta Llama（3 条开源托管）与 DeepSeek（7 条）共 47 条官方价目**（核对日 2026-10-05，来源分级 official / aggregated 如实标注）；币种按厂商原币种落地（DeepSeek CNY、其余 USD，**不虚构汇率不换算**）；峰谷策略 DeepSeek 保留官方高峰 ×2，其余厂商按**恒定价**（official peek = idle）；Anthropic 官方**缓存写价**（`cacheWritePerMillion`）独立承载。摘要与 `cost_guard_status` 官方全景按厂商分组展示币种与定价策略；未启用时行为与 0.9.0 完全一致（零回归）。
->
-> 0.11.0 把官方计价深度同步扩展到**国内主流模型全厂商** —— **国内主流模型官方计价深度同步（CN Mainline Official Pricing Sync）**：注册表从 47 条扩至 **102 条**，新增 **智谱GLM（9 条）、阿里通义Qwen（6 条）、字节豆包（4 条）、月之暗面Kimi（4 条）、百度文心（6 条）、百川（12 条）、MiniMax（3 条）、阶跃星辰（5 条）、讯飞星火（6 条）共 9 家厂商 55 条官方价目**（核对日 2026-10-05，来源分级全部 official 官方定价页直抓）；币种统一 **CNY**（百川/百度官方「元/千 tokens」×1000 折算每百万对齐全局口径）；新增 **baichuan-tier 峰谷策略**（百川 Baichuan2-53B 每日 0-8 点低谷价、8-24 点高峰价×2）；Kimi/MiniMax/Qwen 官方**缓存写价**（`cacheWritePerMillion`）持续承载；智谱/Qwen/百度**阶梯价**主档+note 登记；讯飞星火**免费模型**（0 元）不触发兜底计费。未启用时行为与 0.10.0 完全一致（零回归）。
->
-> 0.12.0 把成本治理从「内部报表」升级为**对标世界前沿标准的可观测 + 可对账成本套件** —— **前沿套件（Frontier Suite）**：对齐 **FinOps FOCUS 规范（v1.2 成本列规格）** 输出标准 JSONL **成本台账**、对齐 **OpenTelemetry GenAI 语义约定**输出标准 **LLM 遥测 span**（trace 关联会话）、落地 **FinOps for GenAI 单位经济学**（成本归属 Showback 到会话/路由、每请求/每百万 token 成本）与 **2026 成本杠杆共识**（缓存读取价≈输入价 0.1 倍可省 90%、输出 token 单价≈输入 4 倍压输出 ROI 最高）——全部以新增可选配置 `frontier` 承载、**默认关闭零回归**，新模块均保持 core 零 DSH 依赖。未启用时行为与 0.11.0 完全一致（零回归）。
->
-> 0.13.0 把代码质量推进到**世界级工程基线** —— **全量代码质量进化（Quality Evolution）**：TS 5 项严格编译选项全开（`exactOptionalPropertyTypes` / `noPropertyAccessFromIndexSignature` / `noFallthroughCasesInSwitch` / `noImplicitOverride` / `noUncheckedSideEffectImports`）并把类型错误**清零**；接入 **ESLint typescript-eslint `strictTypeChecked`** 全面静态检查（88 项违规**归零**，含 2 项有据取舍：跨边界防御式空值回退按防御式编程保留，关闭 `no-unnecessary-condition`；数字格式化文案放行 `allowNumber`）；新增 **`lint` / `coverage` 工程脚本与覆盖率门禁**（全局 stmts ≥ 90%、branch ≥ 85%，`store.ts` 100%）；补测 **45 个新用例**（快照持久化 13、入口集成 5、数值/统计与杠杆边界等）——**319 单测全绿、tsc exit 0、build 成功、冒烟 12 节全过，core 零 DSH 与零回归不变量保持**。
->
-> 0.14.0 补齐成本治理最后一块短板 —— 从「知道超了」升级为「**知道为什么**」 —— **成本根因解释（Explainable Cost RCA）**：市面成本方案止步于统计与归因（Snowflake 官方博客原话：*"knowing that an anomaly occurred is only half the battle. Understanding why the anomaly happened is the other half."*）。0.14.0 新增 **证据化成本根因分析**——按**会话**（哪个任务在烧钱）与**路由**（哪个模型在烧钱）**双视角增量贡献分解**，输出主因/次因/噪声分级（避免长尾刷屏）；新增 **可解释成本叙事**——把结构化证据合成为人类与 Agent 可读的中文总览/根因/建议；注册只读工具 **`cost_guard_explain`**——Agent 可自助「为什么这个月成本涨了」并拿到可执行建议（缓存杠杆 / 输出压缩 / 路由替代）。**默认关闭零回归**，未启用时行为与 0.13.0 完全一致；core 层零 DSH 依赖保持。
->
-> 0.15.0 把「知道为什么」推进到告警现场 —— **根因解释接入告警通知（Explainable Alarm）**：市面成本告警只会喊「超了」（水位数字 + scope），不解释「为什么超、主因是谁、下一步怎么办」。0.15.0 在 Guard 告警/熔断触发时，同一条通知输出**告警根因叙事**（`core/alert-explain.ts`，零 DSH）——scope/水位/Δ + 会话/路由双视角主因（各 1 条，避免刷屏）+ 可执行建议（输出压缩 / 缓存杠杆 / 调用频率检查），单段纯文本与逐行两种格式，可直接转发 IM / 桌面通知；首次触发存量归因并沉淀基线，后续触发与告警前基线对比增量归因（回答「这次为什么超」）；宿主可挂 `onExplainAlarm` 回调取结构化负载（回调抛错自动降级，不影响熔断主流程）。**默认关闭零回归**，未启用时行为与 0.14.0 完全一致；core 层零 DSH 保持。
->
-> 0.16.0 回答企业最关心的第三问 —— **多租户成本解释视图（Multi-Tenant Cost Explanation View）**：市面成本方案（LiteLLM / C1.ai / Azure / Snowflake）的成本归因止步于「会话 / 路由」两个记账维度（任务视角 / 模型视角），都没有回答「**钱是哪个团队 / 项目 / 工作区花的**」。DeepSeek Harness 常被多个租户共用同一实例，成本混在同一个 Meter 账本里。0.16.0 新增 `core/tenant.ts`（零 DSH）补齐**租户维度**：sessionId → 租户解析器（mapping 精确映射 / prefix 前缀映射 / regex 正则提取，未命中兜底内置 `'default'`）+ 租户聚合（四通道金额与 Token 全量带入）+ **租户间归因**（复用 rca.ts 增量贡献分解，无基线退化为存量构成，主因/次因/噪声分级）+ **租户内解释**（对主因租户再做会话视角归因，输出「租户为什么烧钱 → 该租户哪个会话在烧钱」**两级证据链**）+ 中文叙事；只读工具 `cost_guard_tenant` 供 Agent 自助查询「哪个租户在烧钱」。**默认关闭零回归**，未启用时行为与 0.15.0 完全一致；core 层零 DSH 保持。
->
-> 0.17.0 把成本治理推进到推理 token 专项 —— **推理成本专项治理（Reasoning Tax Governance）**：市面 DSH 成本插件（dsh-billing / dsh-cost-meter / dsh-cost-tracker 等）只统计输入 / 输出 / 缓存三通道，无人按推理 token（思维链 / thinking）专项计量与治理；而 2026 年行业共识指出推理 token 按输出价计费、常为可见输出的 **5~20 倍**，是账单里最大的隐藏成本（「思考税」）。0.17.0 把它从「展示项」升级为「**可治理对象**」——独立账本按路由聚合推理 token / 可见输出，按输出价估算税成本与思考税占比（`core/reasoning-tax.ts`，零 DSH）+ **独立推理税预算**水位 ok / warn / block（纯新增治理维度，不干预既有 budgets 熔断语义）+ 中文治理叙事（思考预算压缩 / 路由降级 / 切换非推理模型）+ 只读工具 **`cost_guard_reasoning`**。**默认关闭零回归**，未启用时行为与 0.16.0 完全一致；core 层零 DSH 保持。
->
-> 0.18.0 在路由归因之上再切两刀 —— **多维思考税审计（Multi-Dimension Reasoning Tax Audit）**：0.17.0 回答了「哪条路由在烧思考税」，但还缺两问——「**哪个会话在烧**」与「**什么时候在烧**」。0.18.0 新增**会话维度 Top N 排行（默认 Top 5）+ 时间热力桶（默认 60 分钟 × 最近 24 桶）**双切片审计账本（`core/reasoning-tax-audit.ts`，零 DSH，与路由账本正交、互不读写）——输出主因会话、热力峰值时段及其占全局推理的比例，并给**中文审计叙事**（会话思考预算收敛 / 热点错峰 / 时段预算护栏）+ 只读工具 **`cost_guard_reasoning_audit`**（市面无同类工具）。**默认关闭零回归**，未启用时行为与 0.17.0 完全一致；core 层零 DSH 保持。
+市面现有方案（whale-report 等）全是**事后形态**：跑完一轮才出报告，超支发生后才告诉你。`dsh-cost-guard` 是第一款**原生实时治理插件**：在 `agent/pre-step` 阶段拦下超预算的下一步请求，从源头上阻止模型继续烧钱。
 
----
+| 维度 | 一句话 |
+| --- | --- |
+| **实时性** | 逐次调用立即计量，非事后报告 |
+| **阻断能力** | 请求前熔断 `reject + cancel`，预算用尽即停 |
+| **事前治理** | 预测外推 + 请求预检 + MAD 尖峰检测，超支前拦截 |
+| **动态预算** | 月→日额度派生 + 消费速率背压 + 跨周期结转 |
+| **可解释** | 根因叙事：为什么超 → 主因是谁 → 下一步怎么办 |
+
+## 目录
+
+- [为什么是它](#为什么是它)
+- [核心特性（图文原理）](#核心特性图文原理)
+- [安装](#安装)
+- [配置](#配置)
+- [使用效果](#使用效果)
+- [架构](#架构)
+- [二次开发](#二次开发)
+- [与现有方案对比](#与现有方案对比)
+- [版本演进](#版本演进)
+- [License](#license)
 
 ## 为什么是它
 
@@ -54,73 +45,238 @@ DeepSeek Harness（DSH）是官方开源的 Agent Harness（"一切皆插件"，
 | **计价失真** | 新模型未收录落兜底最贵档、主计量无官方峰谷 | **官方计价引擎**：官方价目 + 官方峰谷自动挂载、旧名别名归一、推理 token 按官方价计量；0.9.0 全模型注册表同步 + 官方状态全景 |
 | **成本不可对账** | 成本数据封闭在插件内部、无法进企业 FinOps/可观测性栈 | **前沿套件**：FOCUS 标准成本台账（JSONL 可流入 FinOps 工具）+ OTel GenAI 语义遥测（可进 Prometheus/Jaeger）+ 单位经济学 Showback + 缓存/输出成本杠杆 |
 
-实时计量的关键是 DSH 的事件闭环：`session/event`（`assistant/message.usage` + `request/header.config`）提供**逐次调用的精确 token 用量与路由**；`agent/pre-step`（waterfall）提供**阻止下一步模型请求**的唯一干净位置。本插件把这两者接成一条防护链，并叠加预测引擎与自适应调节器构成「事后 + 事前 + 动态」三层治理。
+### 三层治理总览
 
-## 特性
+插件把「事后 + 事前 + 动态」三层治理接成一条防护链，全部落在 DSH 的原生事件闭环里：
 
-- **实时计量**：订阅 `session/event`，把每次调用的精确 usage 按路由价格折算金额，累计到 total / day / month / session 四个维度 + 按 `provider/model` 明细。
-- **峰谷计费 + 实时追踪**：支持按本地时区定义任意数量计费时段（如 peak 09:00-18:00、valley 22:00-次日 08:00，支持跨午夜与全天覆盖），每个时段可独立覆盖各模型单价；每次调用按事件发生时刻自动选带定价，未命中时段回退基准价。成本工具/摘要实时输出当前时段、当前时段各模型生效单价、全局/今日分带消耗分布。
-- **话费 + 积分双维度统计**：每个模型可独立配置积分单价（`creditsPerMillion`），计费 token 自动折算积分，与金额独立累计、独立展示（`总花费 X · 总积分 Y`)；未配置积分单价的模型积分按 0 计，不遗漏任何被调用的模型。
-- **多维预算熔断**：session / day / month / total 各自独立配置 `limit`（金额上限）、`warnAt`（告警水位）、`hardAt`（阻断水位）。命中硬限 → 在 `agent/pre-step` 返回 `{kind:'reject'}` 并调用 `agent.cancel({kind:'hook'})` 终止轮次；命中告警 → 只记日志。积分仅统计展示，不影响熔断判定。
-- **预测式治理（0.4.0 新增，默认关闭，零回归）**：
-  - **到期成本投影（Projection）**：为每次调用维护「时刻 → 累计成本」轨迹，用最小二乘线性趋势（≥2 观测点）或固定速率模型（单观测点）外推**今日结束 / 本月底**的预计花费，给出置信区间与置信度；预测成本触及水位即**提前告警/熔断**——不等真超支，先按趋势拦截。
-  - **Time-to-Exhaustion（预算耗尽时间）**：按当前速率计算预算剩余可用时长，回答"还能撑多久"。
-  - **请求级预检（Preflight）**：在每个 `agent/pre-step`，按本轮消息序列的字符量启发式估算本次调用成本（输入 + 按比例预估输出），若"已花 + 本次估算 ≥ 指定预算"则在**请求发出之前**拒绝对话轮——连串中等请求也无法悄悄透支。
-  - **成本尖峰检测（MAD）**：对每次请求成本维护滑动窗口，用稳健 MAD（中位数绝对偏差）估计基准，修正 z 分数分级 `normal / spike / extreme`；异常尖峰即刻触达告警或硬熔断（抗单点污染，少量大请求不污染基准）。
-- **自适应调节治理（0.5.0 新增，默认关闭，零回归）**：
-  - **月度 → 日额度动态派生（Derivation）**：给定月预算、月内已花费与剩余天数，按 `剩余可用 × (1-留存) ÷ 剩余天数` 动态算出「今天还能花多少」，月末没用完的额度折算进剩余天数，反之亦然——无需逐日手配。
-  - **消费速率背压动态水位（Backpressure）**：喂入预测引擎的「今日结束 / 月末结束」预测成本，若预测超支，按超支比例自动**收紧**今日额度与告警/阻断水位（背压），预测越险、水位越低、越早熔断；预测从容时适度放开——"花得快就紧，花得稳就松"。
-  - **跨周期结转（Carry-over）**：本月未用完的预算按 `carryOverRatio` 结转为下月可用池（`carriedIn`），"上个月省下来的"变成"这个月可以用的"，而不是被清零浪费。
-  - **成本感知 cue（calm / frugal / minimal）**：每次决策输出当前成本姿态——平静（从容）/ 节约（收紧中）/ 最小化（今日额度已耗尽），模型与用户一眼看懂"现在该不该省"；今日动态额度耗尽时按 `onExhausted` 告警或熔断本周期。
-- **成本效率洞察（0.5.0 新增）**：
-  - **每千输出 token 成本**：输出是推理质量的主要载体，按路由给出「每千输出 token 花了多少」，识别"贵在哪儿"。
-  - **单请求成本分布**：以单次请求成本样本（窗口内）计算 **P50 / P95 / Max / Avg**，揪出拖垮预算的长尾请求。
-  - **路由替代节约估算**：用当前路由的累计用量（input+output token）按更便宜路由的单价重算，给出可执行的「换用 X 预计可省 Y 元（约 Z%）」建议。
-- **缓存维度计量（0.6.0 新增，默认关闭，零回归）**：
-  - **三通道 × 峰谷定价**：解析每次请求的缓存命中 Token（`prompt_tokens_details.cached_tokens`），按「输入-命中 / 输入-未命中 / 输出」三通道 × 官方高峰/空闲时段精确计价；价格获取顺序为「路由级覆盖 > 全局覆盖 > 内置官方表（DeepSeek 2026-09-10 生效价，flash / v4-pro，高峰为空闲 2 倍）」。高峰 = 北京时间周一至周五（非法定节假日）9:00-12:00 与 14:00-18:00，跨午夜按请求发起时刻归属。
-  - **Token 加权命中率**：按会话 / 路由 / 全局三级汇总输入 Token 缓存命中比例（命中 Token ÷ 输入 Token 总数，不用简单平均）。
-  - **缓存收益金额**：相对「全部输入按未命中价计费」基线，缓存命中带来的实际节省（`saving = baselineCost - cost`）。
-  - **可优化前缀提示**：识别高频重复且未命中占比高的输入前缀（`minRepeat`=3、`minSaving`=0.50 元默认），输出「前缀 X 近 N 次均未命中，若稳定化可节省约 Y 元」，只提示、不自动改写 Prompt。
-  - **失败回退与不确定度**：缓存命中字段缺失 / 异常时，按未命中计费并标注 `uncertainty: cached-unknown`（或 `malformed`），命中率不纳入可信汇总、单独计入不确定请求数；连续 5 次回退输出一次性提示（升级 DSH 或检查网关）。
-- **官方计价引擎（0.8.0 新增，默认关闭，零回归）**：
-  - **官方价目统一挂载**：主计量 + 缓存计量统一走 DeepSeek 官方价目（2026-09-10 生效：flash 空闲 命中 0.02 / 未命中 1.00 / 输出 4.00 元/M、v4-pro 空闲 0.15 / 4.50 / 13.50 元/M，高峰 = 空闲 ×2）；用户 `pricing` / `bands` / `cache.priceOverride` 覆盖始终优先于官方价。
-  - **官方峰谷自动判定**：主计量未配置 `bands` 时也按官方口径选带——北京时间周一至周五（**不含中国法定节假日**）9:00-12:00 与 14:00-18:00 高峰，周六周日与法定节假日全天低谷；2026 全年节假日表内置，`officialPricing.holidays` 可追加/覆盖日期（补班日恢复高峰）。
-  - **模型名别名归一**：官方已下线但仍可调用的 `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` 自动归一到 flash 官方价，不再因模型名未收录而落兜底最贵档（此前命中价高估 50 倍、输出价高估 4 倍）。
-  - **推理 token 洞察**：从 `usage.reasoning_tokens` 采集思维链 token，按官方输出价（官方无单独推理价格）累加推理成本，独立输出累计 token 与金额——回答"思维链花了多少钱"。
-  - **不虚构规则**：官方无 Batch API 批量折扣，第三方渠道的折扣行为一律不纳入产品口径。
-  - **全模型官方注册表（0.9.0）**：一张 `OFFICIAL_MODEL_REGISTRY` 登记 DeepSeek 官方全部模型——在售（active，官方价目）、下线路由（routed，归一现行模型价）、已停用（decommissioned，停用日期 + 迁移建议，取价回落内置/兜底零回归）；价目与别名由注册表派生，`cost_guard_status` 与摘要新增官方模型状态全景（在售 N 个 · 下线路由 M 个 · 已停用清单与迁移提示）。
-- **多厂商官方计价深度同步（0.10.0）**：注册表扩展 **provider / currency / peakPolicy / sourceLevel / verifiedAt** 五维元数据，登记 6 大厂商 47 条官方价目 —— OpenAI GPT（8）、Anthropic Claude（13，含缓存读价+写价 `cacheWritePerMillion`）、Google Gemini（10）、Mistral（6）、Meta Llama（3，开源托管）、DeepSeek（7）；币种 DeepSeek=CNY、其余=USD（不换算）；DeepSeek 官方高峰 ×2、其余厂商恒定价（official peek=idle）；来源分级 official / aggregated 如实标注（未抓到官方值处保守取输入价 + note）。`officialProviderOf/officialCurrencyOf/officialPeakPolicyOf/officialSourceLevelOf/officialVerifiedAtOf` 派生，summary 按厂商分组展示，`official.prices` 路由按厂商标签输出。
-- **国内主流模型官方计价深度同步（0.11.0）**：注册表总量 47 → **102 条**，新增 9 家国内厂商 **55 条官方价目**（智谱 GLM-5.3 系 / 通义 Qwen3.8 系 / 豆包 Seed2.1 系 / Kimi K3 系 / 文心 ERNIE-5.0 系 / 百川全系 / MiniMax M2.7 系 / 阶跃 Step 系 / 星火 X2.5 系，全部 CNY、官方定价页直抓）；**计价单位对齐**——百川/百度官方「元/千 tokens」×1000 折算每百万；新增 **baichuan-tier 峰谷策略**（Baichuan2-53B 每日 0-8 点低谷 / 8-24 点高峰 ×2，`officialBandForEpochOf` 按模型选带，flat 回落峰谷判定但不影响价格）；缓存写价持续承载（Kimi K3 20 / MiniMax 2.625 / Qwen 显式缓存创建 1.25 / 1）；阶梯价主档+note（GLM-5.1 系 / Qwen3-Max 系 / ERNIE-5.0 系）；免费模型 0 价不触发兜底（星火 X2.5-4B / 1.7B / Lite）。
-- **前沿套件（0.12.0 新增，默认关闭，零回归）**：对齐世界前沿标准的成本可观测 + 可对账能力——
-  - **FOCUS 成本台账（FinOps 标准规格）**：按 FinOps Foundation FOCUS 规范（v1.2）的 Dimension/Metric 列规格输出**标准成本台账行**（`FocusUsageLine`：路由于账目/行类型/计费周期/用量分通道/金额/EflectiveCost 列），4096 行内存缓冲 + `sink` 回调按行流出（可写 JSONL 文件或转发任意 FinOps 工具），回答"发给财务/FinOps 平台的数据能不能直接对账"；
-  - **OTel GenAI 遥测（OpenTelemetry GenAI 语义）**：按 OTel GenAI Semantic Conventions 生成标准 `GenAiSpan`（`gen_ai.operation.name` / `gen_ai.request.model` / `gen_ai.response.model` / `gen_ai.system` / `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` + `dsh.*` 扩展），用 FNV-1a + 稳定十六进制派生 **trace/session 关联 ID**，`sink` 回调流出，回答"成本能进现有可观测性栈（Prometheus/Jaeger/Grafana）吗"；
-  - **单位经济学与成本归属（FinOps for GenAI Showback）**：会话/路由归属矩阵——**每请求成本、每百万 token 成本、Top-N 会话成本占比与份额**（Showback 到业务单元），回答"钱花在哪个会话/哪条路由上、单次任务单价多少"；
-  - **成本杠杆洞察（2026 缓存/输出杠杆共识）**：**缓存折扣杠杆**——缓存读取价 vs 标准输入价的价差倍数（DeepSeek flash 0.02 vs 1.00 = 50 倍）、当前已省率与**可再省率**，给出「提高缓存命中还能再省 Y 元」；**输出杠杆**——输出 token 单价 vs 输入的价差倍数与输出成本占比（输出是质量杠杆），给出「输出压缩 10% 可省 Y 元」；只提示、不干预请求。
-- **成本根因解释（0.14.0 新增，默认关闭，零回归）**：超越「统计与展示」，回答"**为什么成本是这个样子的**"——
-  - **证据化成本根因分析（`core/rca.ts`）**：按**会话**（哪个任务在烧钱）与**路由**（哪个模型在烧钱）**双视角增量贡献分解**；与可选基线（前一时段/期初快照）对比逐因子归因 **Δ 成本**（无基线退化为存量构成归因）；因子分级 **主因/次因/噪声**（topN 截断 + 低贡献合并，避免长尾刷屏）；通道构成（输入/缓存命中/输出占比，只基于 token 事实）；
-  - **可解释成本叙事（`core/explain.ts`）**：把结构化证据合成为**中文总览/根因因子句/可执行建议**——缓存命中杠杆（"命中率仅 X%，已省 Y 元，提命中再省 N 倍"）、输出压缩杠杆（"输出占计费 token X%，压缩 10% 可省 Y 元"）、路由替代提示——不再让用户面对裸数字；
-  - **只读诊断工具 `cost_guard_explain`**：Agent 可自助提问"**为什么这个月成本涨了**"，返回结构化根因 + 证据 + 建议（`current` 存量归因 / `delta` 与上次查询增量归因双模式），面板 `explain` 段并入 `cost_guard_status`；未配置时整体缺省（行为与 0.13.0 完全一致）。
-- **告警根因解释（0.15.0 新增，默认关闭，零回归）**：把根因分析送到**告警现场**，回答"这条告警为什么触发、主因是谁、怎么办"——
-  - **告警根因叙事（`core/alert-explain.ts`，零 DSH）**：首句先答「为什么告警」（scope/水位/（spent/limit）/Δ/附加说明），再给**会话/路由双视角主因**（各 1 条，避免刷屏）+ 最多 2 条**可执行建议**（输出压缩 / 缓存杠杆 / 调用频率检查），单段纯文本与逐行两种格式，可直接转发 IM 或桌面通知；
-  - **告警装配（`harness/alert.ts`）**：挂载在 `onViolation` 之后，把 Guard 决策投影为告警信号并复用 ExplainRuntime 基线语义——**首次触发存量归因并沉淀基线，后续触发与告警前基线对比增量归因**（回答"这次为什么超"）；宿主回调 `onExplainAlarm` 可收结构化负载（scope/action/window/report/lines），回调抛错自动降级不影响熔断主流程；
-  - **接入既有告警管道**：`explain.alert.enabled=true` 时告警日志追加 `告警根因：` 行（scope/水位/Δ + 主因 + 建议），启动摘要追加 `+ 告警根因通知`；未配置 alert 时告警行为与 0.14.0 完全一致（零回归）。
-- **多租户成本解释视图（0.16.0 新增，默认关闭，零回归）**：把成本归因从「会话 / 路由」推进到企业级「**租户**」维度，回答"钱是哪个团队 / 项目 / 工作区花的"——
-  - **租户解析器（`core/tenant.ts`，零 DSH）**：`tenantResolverOf` 按「mapping 精确映射 > prefix 前缀映射 > regex 正则提取」三级规则把 sessionId 归到租户，未命中任一级兜底内置 `'default'`，完全由调用方配置、不侵占用例元数据；`aggregateTenantBuckets` 把会话桶按租户归并（金额 / Token 四通道全量带入，纯加和）；
-  - **租户间归因 + 租户内两级证据链（`core/tenant.ts`）**：`analyzeTenantRca` 复用 rca.ts 增量贡献分解——**租户间**标识主因/次因/噪声租户（无基线退化为存量构成归因、有基线按 Δ 分解贡献），对主因租户再对其内部会话做一次会话视角归因，输出「租户为什么烧钱 → 该租户哪个会话在烧钱」的两级证据链；`buildTenantExplanation` 输出中文叙事（总览/因子句/建议）；
-  - **只读诊断工具 `cost_guard_tenant`（`harness/tenant.ts`）**：Agent 可自助提问"**哪个租户在烧钱**"，返回结构化租户报表 + 中文叙事（`current` 存量归因 / `delta` 与上次查询增量归因双模式）；`cost_guard_status` 面板新增 `tenant` 段、摘要新增多租户行；未配置时整体缺省（行为与 0.15.0 完全一致）。
-- **推理成本专项治理（0.17.0 新增，默认关闭，零回归）**：把思维链「思考税」从**展示项**升级为**可治理对象**——独立于金额预算的推理 token 专项治理维度，回答"推理（思考）token 花了多少 / 在哪里烧 / 怎么省"——
-  - **思考税账本（`core/reasoning-tax.ts`，零 DSH）**：按路由聚合推理 token / 可见输出 / 推理成本（推理 token × 输出价），输出全局与逐路由思考税占比（`taxRatio` = 推理 ÷（推理 + 可见输出））与主因路由识别——2026 行业共识：推理 token 按输出价计费、常为可见输出的 5~20 倍，是账单最大的隐藏成本（市面 DSH 成本插件 dsh-billing / dsh-cost-meter / dsh-cost-tracker 均无此专项）；
-  - **独立推理税预算（`reasoningTax.budget`）**：`limit` + `warnAt` / `hardAt` → 水位 **ok / warn / block**——纯新增治理维度，不干预既有 budgets 熔断语义；`limit > 0` 才启用水位判定，未配置预算仅做洞察展示（无水位判定）；
-  - **中文治理叙事（summary / factor / suggestion）**：思考税花在哪（主因 / 次因路由）、怎么省——思考预算压缩（`thinking_budget` / `max_tokens`）、路由降级、切换非推理模型，并可提示「为推理税单独设置预算」；
-  - **只读诊断工具 `cost_guard_reasoning`（`harness/reasoning-tax.ts`）**：Agent 可自助"**推理 token 花了多少 / 为什么 / 怎么省**"，返回结构化思考税报表（逐路由聚合 / taxRatio / 税成本 / 预算水位）+ 证据 + 建议；面板 `reasoningTax` 段并入 `cost_guard_status`。
-- **多维思考税审计（0.18.0 新增，默认关闭，零回归）**：在 0.17.0 路由归因之上新增「**会话 Top N + 时间热力桶**」双切片审计，回答"哪个会话在烧思考税 / 一天中何时烧得最集中"——
-  - **会话维度 Top N 排行（`core/reasoning-tax-audit.ts`，零 DSH）**：按 sessionId 聚合推理 token / 可见输出 / 税成本，输出 Top N 会话排行（默认 `sessionTopN` 5）与主因会话及其占全局推理的比例——定位"谁的思考链最贵"；
-  - **时间热力桶**：按固定时长桶（`bucketMinutes` 默认 60 分钟）聚合推理 token 与税成本，保留最近 `heatBuckets`（默认 24）个桶，输出热力序列（按开始时刻升序）与热力峰值桶——定位"思考税在一天中何时集中"；
-  - **中文审计叙事**：主因会话 / 热力峰值 / 占全局推理比例 + 治理建议（会话思考预算收敛 / 热点错峰拆分 / 为高峰时段设置独立推理税预算护栏）；
-  - **只读诊断工具 `cost_guard_reasoning_audit`（`harness/reasoning-tax-audit.ts`）**：Agent 可自助"**哪个会话在烧思考税 / 怎么收**"，返回会话 Top N 排行 + 热力序列 + 证据 + 建议（市面无同类工具）；面板 `reasoningTaxAudit` 段并入 `cost_guard_status`。
-- **成本面板**：注册只读工具 `cost_guard_status`（模型可调用）与 `CostGuardService`（`ctx.costGuard`，其他插件可注入），并暴露人读摘要。0.4.0 起工具/摘要新增 `forecast` 段（今日/月末投影、置信区间、尖峰级别、预测式触发明细）；0.5.0 起新增 `adaptive` 段（动态额度/剩余/背压/动态水位/结转/cue）与 `efficiency` 段（每千输出成本、请求分布、替代节约建议）；0.12.0 起新增 `frontier` 段（FOCUS 行数 / OTel span 数 / 单位经济学 / 杠杆洞察）；0.14.0 起新增 `explain` 段（成本根因报表 + 中文叙事，`explain.enabled=true` 时）；0.16.0 起新增 `tenant` 段（多租户成本解释报表 + 两级证据链中文叙事，`tenant.enabled=true` 时）；0.17.0 起新增 `reasoningTax` 段（思考税报表 + 预算水位，`reasoningTax.enabled=true` 时）；0.18.0 起新增 `reasoningTaxAudit` 段（会话 Top N + 时间热力报表 + 中文审计叙事，`reasoningTaxAudit.enabled=true` 时）。
+```mermaid
+flowchart LR
+  subgraph T0["事后治理 · 0.3.0"]
+    M["实时计量<br/>core/meter.ts 四维账本"] --> B["预算水位判定<br/>告警 / 熔断"]
+  end
+  subgraph T1["事前治理 · 0.4.0"]
+    F["轨迹外推投影<br/>今日 / 月末预测"] --> B
+    S["MAD 尖峰检测"] --> B
+    P["请求级预检估算"] --> B
+  end
+  subgraph T2["动态治理 · 0.5.0"]
+    G["自适应调节<br/>月度→日额度派生 · 背压 · 结转"] --> B
+  end
+  B -->|"熔断"| R["拒绝 + 取消<br/>agent/pre-step 熔断"]
+  B -->|"告警"| W["告警日志<br/>onViolation 通知"]
+  B -->|"放行"| N["放行 next()"]
+```
+
+实时计量的关键是 DSH 的事件闭环：`session/event`（`assistant/message.usage` + `request/header.config`）提供**逐次调用的精确 token 用量与路由**；`agent/pre-step`（waterfall）提供**阻止下一步模型请求**的唯一干净位置。
+
+## 核心特性（图文原理）
+
+### 实时计量与峰谷计费
+
+订阅 `session/event`，把每次调用的精确 usage 按路由价格折算金额与积分，累计到 total / day / month / session 四个维度 + 按 `provider/model` 明细，并按事件发生的本地时刻选档计价（支持跨午夜与全天时段）：
+
+```mermaid
+sequenceDiagram
+  participant DSH as DeepSeek Harness
+  participant L as listener.ts
+  participant P as pricing.ts
+  participant M as Meter
+  participant W as WindowMeter
+  DSH->>L: session/event（request/header）
+  L->>L: 记录当前路由 provider/model
+  DSH->>L: session/event（assistant/message.usage）
+  L->>P: 路由 + 精确 usage + 事件时刻
+  P->>P: 峰谷选带 bandIdForEpoch + 单价
+  P->>M: UsageEntry（金额 + 积分）
+  P->>W: 日 / 月窗口累计
+  M->>M: total / day / month / session<br/>+ 路由 + 会话 + 分带四路明细
+```
+
+*图注：`session/event` 是计量唯一数据源；`pricing.ts` 纯函数选带计价，未命中时段回退基准价；金额与积分（`creditsPerMillion`）双维度独立累计，积分不参与熔断判定。*
+
+### 多维预算熔断
+
+session / day / month / total 各自独立配置 `limit` / `warnAt` / `hardAt`。命中硬限 → 在 `agent/pre-step` 返回 `reject` 并 `agent.cancel` 终止轮次；命中告警 → 只记日志并触发 `onViolation`：
+
+```mermaid
+flowchart LR
+  IN["预算输入<br/>已花费（total/day/month/session）<br/>+ 可选 预测 / 自适应"] --> EV{"预算评估器<br/>决策（已花费）"}
+  EV -->|"对每个 limit>0 的 scope"| W{"ratio = spent / limit"}
+  W -->|"ratio ≥ hardAt"| H["熔断触发"]
+  W -->|"warnAt ≤ ratio < hardAt"| WA["告警触发"]
+  W -->|"ratio < warnAt"| OK["正常"]
+  EV -->|"predictive.projections"| PJ["预测成本 ≥ 水位 → 提前触发"]
+  EV -->|"predictive.spike（MAD）"| SP["尖峰级别 ≥ 策略 → 触发"]
+  EV -->|"predictive.preflight"| PF["已花 + 本轮估算 ≥ limit → 拦截"]
+  EV -->|"adaptive.exhausted"| AD["今日额度耗尽 → 告警 / 熔断"]
+  H --> BLOCK["拒绝 + 取消熔断"]
+  PJ --> BLOCK
+  SP --> BLOCK
+  PF --> BLOCK
+  AD --> BLOCK
+  WA --> WARN["告警日志 + onViolation"]
+  PJ --> WARN
+  SP --> WARN
+  OK --> ALLOW["放行 next()"]
+```
+
+*图注：动作为「一票否决」式升级——hard 一律 block；warn 仅在仍为 allow 时提升；`limit <= 0` 的 scope 直接跳过（不设限），这是「零配置 = 只计量不干预」的语义来源。*
+
+### 预测式治理（0.4.0，默认关闭，零回归）
+
+为每次调用维护「时刻 → 累计成本」轨迹，外推**今日结束 / 本月底**预计花费并给出置信区间；叠加 MAD 尖峰检测与请求级预检，在超支**发生之前**拦截：
+
+```mermaid
+flowchart LR
+  T["CostTrail 轨迹采样<br/>时刻 → 累计成本"] --> P{"观测点 ≥ 2?"}
+  P -->|"是"| OLS["OLS 线性趋势外推"]
+  P -->|"否"| FIX["固定速率模型"]
+  OLS --> PROJ["今日结束 / 月末投影<br/>+ 置信区间 + 耗尽时刻"]
+  FIX --> PROJ
+  PROJ --> TRIG{"投影 / limit<br/>≥ 水位?"}
+  TRIG -->|"warnAt"| WR["提前告警"]
+  TRIG -->|"hardAt"| HB["提前熔断"]
+  A["MadDetector<br/>滑动窗口 MAD 稳健检测"] --> SPK["尖峰 / 极端 分级"]
+  SPK -->|"动作：告警"| WR
+  SPK -->|"动作：熔断"| HB
+  MSG["pre-step 消息序列字符量"] --> EST["请求成本估算<br/>最小 / 期望"]
+  EST -->|"已花 + 估算 ≥ limit"| HB
+```
+
+*图注：投影用最小二乘线性趋势（≥2 观测点）或固定速率模型（单观测点）；MAD（中位数绝对偏差）抗单点污染，少量大请求不污染基准；预检在「花出去之前」判断，连串中等请求也无法悄悄透支。*
+
+### 自适应调节（0.5.0，默认关闭，零回归）
+
+把预算从「静态配额」升级为「会自我调节的额度」——月度→日额度动态派生 + 消费速率背压动态水位 + 跨周期结转：
+
+```mermaid
+flowchart LR
+  MA["月可用池<br/>monthLimit + carriedIn − 已花"] --> DA["日均可用<br/>剩余 × (1 − reserveRatio) ÷ 剩余天数"]
+  F["预测：今日结束 / 月末花费"] --> BP["背压因子<br/>预测超支 → 收紧（≤1）"]
+  DA --> AL["今日动态额度<br/>dayAllowance = max(floor, dailyBase × pressure)"]
+  BP --> AL
+  AL --> LV["动态水位<br/>背压越强越靠前"]
+  AL -->|"已花 ≥ 额度"| EX["今日额度耗尽（熔断态）<br/>onExhausted: 告警 / 熔断"]
+  LV --> CU["成本提示<br/>从容 / 节俭 / 最低"]
+  PM["本月预测剩余"] -->|"× carryOverRatio"| CO["下月结转 carriedIn 可用池"]
+  CO --> MA
+```
+
+*图注：默认 `reserveRatio=0.1`（只敢动用 90%）、`backpressure=0.5`、`floorRatio=0.3`（无论如何保留 30% 兜底）、`carryOverRatio=1`（全量结转）。「花得快就紧，花得稳就松；省下来的变成下个月的池子」。*
+
+#### 成本效率洞察（0.5.0）
+
+每千输出 token 成本（输出是推理质量的主要载体）、单请求成本分布（P50 / P95 / Max / Avg，揪出拖垮预算的长尾请求）、路由替代节约估算（"换用 X 预计可省 Y 元"）。
+
+### 缓存维度计量（0.6.0，默认关闭，零回归）
+
+DeepSeek 三通道计费下缓存命中与未命中价差高达 30–50 倍，此前所有输入都按未命中价计费、系统性高估成本。本插件精确解析每次请求的缓存命中 Token，按三通道 × 峰谷定价：
+
+```mermaid
+flowchart LR
+  USG["usage.prompt_tokens_details<br/>cached_tokens"] --> PARSE["core/cache-parse.ts<br/>校验 / 缺失 / 异常标注"]
+  PARSE --> C3["三通道 × 峰谷计价<br/>输入命中 / 输入未命中 / 输出<br/>× 高峰 / 空闲两档"]
+  PR["价格优先级<br/>路由覆盖 > 全局覆盖<br/>> 官方多厂商表 > 内置官方表"] --> C3
+  C3 --> RATE["Token 加权命中率<br/>会话 / 路由 / 全局三级"]
+  C3 --> SAVE["缓存收益金额<br/>相对「全未命中」基线"]
+  C3 --> HINT["可优化前缀提示<br/>minRepeat=3 · minSaving=0.50"]
+  PARSE -->|"字段缺失 / 异常"| FB["按未命中计费<br/>不确定标注 · 连续 5 次提示"]
+```
+
+*图注：命中率按 Token 加权而非简单平均（不被小请求稀释）；收益 = 基线成本 − 实际成本；前缀提示只提示不自动改写 Prompt；失败回退保证指标可信、可审计。*
+
+### 官方计价引擎（0.8.0+，默认关闭，零回归）
+
+对 DeepSeek 官方实际计价规则做最准确表达，并从 0.9.0 起扩展为**全模型/全球/国内主流模型官方价目深度同步**（注册表 102 条，核对日 2026-10-05）：
+
+```mermaid
+flowchart LR
+  REG["OFFICIAL_MODEL_REGISTRY<br/>102 条官方价目<br/>（DeepSeek / OpenAI / Anthropic / Google<br/>Mistral / Meta / 智谱 / 通义 / 豆包 / Kimi<br/>文心 / 百川 / MiniMax / 阶跃 / 星火）"] --> DER["价目 / 别名 / 状态派生<br/>provider / currency / peakPolicy<br/>sourceLevel / verifiedAt"]
+  HOL["2026 中国法定节假日表<br/>+ holidays 追加 / 覆盖"] --> BAND["官方峰谷判定<br/>周一~周五 9:00-12:00 / 14:00-18:00 ×2<br/>百川阶梯 · 恒定价"]
+  DER --> MT["主计量 / 缓存计量挂载"]
+  BAND --> MT
+  AL["模型名别名归一<br/>deepseek-v4-flash → flash 官方价"] --> MT
+  RT["usage.reasoning_tokens"] --> RL["推理 token 账本<br/>按官方输出价估算"]
+  OV["用户 pricing / bands<br/>/ cache.priceOverride"] -. 始终优先 .-> MT
+  MT --> L1["listener.ts 逐事件入账"]
+```
+
+*图注：用户覆盖始终优先于官方价（覆盖价不参与高峰翻倍）；官方无 Batch 折扣不虚构；已停用模型如实登记停用日期与迁移建议；币种 DeepSeek/国内厂商 CNY、海外厂商 USD，不跨币种换算。*
+
+### 前沿套件（0.12.0，默认关闭，零回归）
+
+对齐世界前沿标准的可观测 + 可对账能力——FOCUS 成本台账（FinOps v1.2，JSONL 行流出可流入任意 FinOps 工具）、OTel GenAI 遥测（标准 span 属性 + trace/会话关联，可进 Prometheus/Jaeger）、单位经济学与成本归属（每请求/每百万 token 成本、Top-N 会话份额，Showback 到业务单元）、成本杠杆洞察（缓存折扣杠杆与输出杠杆的已省率 / 可再省率）。
+
+### 成本根因解释（0.14.0，默认关闭，零回归）
+
+从「知道超了」到「**知道为什么**」——会话（哪个任务）/ 路由（哪个模型）双视角增量贡献分解，输出主因/次因/噪声分级与中文可解释叙事：
+
+```mermaid
+flowchart LR
+  SNAP["meter.snapshot()<br/>会话 / 路由账本"] --> RCA["core/rca.ts<br/>双视角增量贡献分解"]
+  BASE["基线快照<br/>（期初 / 上次查询）"] -->|"Δ 增量归因"| RCA
+  RCA --> GRD["主因 / 次因 / 噪声 分级<br/>topN 截断防长尾刷屏"]
+  GRD --> NARR["core/explain.ts<br/>中文可解释叙事<br/>总览 / 根因因子 / 建议"]
+  NARR --> T["cost_guard_explain 只读工具<br/>存量 / 增量 双模式"]
+  V["onViolation 告警 / 熔断"] --> AE["alert-explain（0.15.0）<br/>告警根因叙事<br/>「为什么超」+ 主因 + 建议"]
+```
+
+### 多租户成本解释视图（0.16.0，默认关闭，零回归）
+
+把成本归因推进到企业级「租户」维度：钱是哪个团队 / 项目 / 工作区花的。sessionId → 租户解析 → 租户间归因 + 租户内主因会话两级证据链：
+
+```mermaid
+flowchart LR
+  SID["sessionId"] --> RES["core/tenant.ts 解析器<br/>精确映射 > 前缀映射<br/>> 正则提取"]
+  RES -->|"未命中任一级"| DF["兜底 default"]
+  RES --> TN["租户聚合<br/>四通道金额 / Token 全量"]
+  DF --> TN
+  TN --> RCA2["租户间归因<br/>复用 rca 增量贡献分解<br/>主因 / 次因 / 噪声"]
+  RCA2 --> EV["两级证据链<br/>主因租户 → 该租户主因会话"]
+  EV --> N["中文叙事<br/>+ cost_guard_tenant 只读工具"]
+```
+
+### 推理成本专项治理（0.17.0，默认关闭，零回归）
+
+把「思考税」（推理 token 常为可见输出 5~20 倍，按输出价计费，是账单最大的隐藏成本）从展示项升级为可治理对象：
+
+```mermaid
+flowchart LR
+  RT["usage.reasoning_tokens<br/>（思维链）"] --> LG["core/reasoning-tax.ts<br/>按路由聚合"]
+  PR["推理 token × 输出价<br/>= 思考税成本估算"] --> LG
+  LG --> R["taxRatio 思考税占比<br/>推理 ÷（推理 + 可见输出）"]
+  LG --> D["主因路由识别"]
+  BG["独立推理税预算<br/>limit > 0 才启用<br/>告警 0.8 · 熔断 1"] --> LV["水位<br/>正常 / 告警 / 熔断"]
+  R --> NAR["中文治理叙事<br/>压缩思考预算 · 路由降级 · 切换非推理模型"]
+  D --> NAR
+  LV --> NAR
+  NAR --> T["cost_guard_reasoning<br/>面板 reasoningTax 段"]
+```
+
+*图注：独立推理税预算为纯新增治理维度，不干预既有 budgets 熔断语义；未配置预算（limit=0）时仅做洞察展示，无水位判定。*
+
+### 多维思考税审计（0.18.0，默认关闭，零回归）
+
+在路由归因之上再切两刀——「哪个会话在烧」+「什么时候在烧」：会话维度 Top N 排行 + 时间热力桶双切片：
+
+```mermaid
+flowchart LR
+  E["UsageEntry + sessionId"] --> S["会话切片<br/>按 sessionId 聚合推理 token"]
+  E --> H["时间热力桶<br/>bucketMinutes=60 分钟<br/>× heatBuckets=24 个桶"]
+  S --> TOP["会话 Top N 排行<br/>sessionTopN=5<br/>主因会话 + 占全局推理比例"]
+  H --> PK["热力序列 + 峰值桶<br/>一天中何时烧得最集中"]
+  TOP --> N["中文审计叙事<br/>会话思考预算收敛 · 热点错峰 · 时段预算护栏"]
+  PK --> N
+  N --> T["cost_guard_reasoning_audit<br/>面板 reasoningTaxAudit 段"]
+```
+
+*图注：审计账本与 0.17.0 路由账本正交互不读写；`sessionTopN` 范围 1~50、`bucketMinutes` 范围 1~1440、`heatBuckets` 范围 1~168。*
+
+### 成本面板 · 价格覆盖 · 安全默认
+
+- **成本面板**：注册只读工具 `cost_guard_status`（模型可调用）与 `CostGuardService`（`ctx.costGuard`，其他插件可注入），暴露人读摘要；0.4.0 起含 `forecast` 段、0.5.0 起含 `adaptive` / `efficiency` 段、0.12.0 起含 `frontier` 段、0.14.0 起含 `explain` 段、0.16.0 起含 `tenant` 段、0.17.0 起含 `reasoningTax` 段、0.18.0 起含 `reasoningTaxAudit` 段。
 - **价格覆盖**：内置 DeepSeek 官方价（`deepseek-chat` / `deepseek-reasoner`），支持按 `provider/model` 或裸 `model` 覆盖，未识别路由走保守兜底价。
-- **安全默认**：默认 `mode=block` 硬熔断 + `cancelOnBlock=true`；想纯观察可 `mode=off`（只计量不干预）。预测式治理与自适应调节默认不配置 = 行为与 0.3.0 完全一致。
+- **安全默认**：默认 `mode=block` 硬熔断 + `cancelOnBlock=true`；想纯观察可 `mode=off`；预测式治理与自适应调节默认不配置 = 与 0.3.0 行为完全一致。
 
 ## 安装
 
@@ -319,6 +475,8 @@ plugins:
 
 > 落地形态建议：可视化配置页仅需「必填表单层」（预算上限，可选展开今日/会话/总额与告警水位）+「功能开关层」（各模块一句话说明、默认关闭、开启即用最优参数），高级参数（`priceOverride`、`tenant.resolve` 等）折叠在「高级」区。
 
+
+
 ## 使用效果
 
 - 预算内：静默计量，Agent 调用 `cost_guard_status` 可自感知用量（含话费与积分两个维度）。
@@ -380,9 +538,40 @@ plugins:
   - `cost_guard_status` 返回结构新增 `reasoningTaxAudit` 段：`window`（current）+ `sessionTopN` / `heatBuckets` + `report`（`totalReasoningTokens` / `totalOutputTokens` / `totalTaxCost` / `taxRatio` / `sessionRequests` / `sessions`（key/requests/reasoningTokens/outputTokens/taxCost，Top N 按税成本降序）+ `heat`（start/end/…，按开始时刻升序、最多 heatBuckets 个桶）+ `dominantSession` 主因会话 + `dominantBucket` 热力峰值桶）；
   - 摘要新增审计行：`推理税审计: 推理 3,000,000 tokens（思考税 88% · 估算 12.00） · 主因会话 session-1 · 热力峰值 09:00 起 1h`（会话数 >1 时追加降序排行行）；Agent 工具输出 `summary` + `narrative` + `explanation`（中文审计叙事 + 治理建议）。
 
+
+
 ## 架构
 
-六边形架构，领域核心与 DSH 运行时解耦：
+六边形架构：领域核心（`core/`，零 DSH 依赖）与 DSH 运行时（`harness/`，唯一接触 DSH API 的薄适配层）解耦；`index.ts` 负责装配、`service.ts` 暴露 `CostGuardService` 契约。
+
+```mermaid
+flowchart TD
+  subgraph CORE["core/ · 零 DSH 领域层"]
+    C1["meter / pricing / budget"]
+    C2["forecast / anomaly / governor / efficiency"]
+    C3["cache-parse / cache-pricing / cache-metrics / cache-hint"]
+    C4["official-pricing / focus-ledger / otel-genai / unit-economy / leverage"]
+    C5["rca / explain / alert-explain / tenant"]
+    C6["reasoning-tax / reasoning-tax-audit"]
+  end
+  subgraph HARN["harness/ · 薄适配层"]
+    H1["listener / guard / tool"]
+    H2["predictive / adaptive / cache / frontier"]
+    H3["explain / alert / tenant"]
+    H4["reasoning-tax / reasoning-tax-audit"]
+  end
+  subgraph ENTRY["入口"]
+    E1["index.ts · 配置 schema / 装配"]
+    E2["service.ts · CostGuardService 契约"]
+  end
+  DSH["DeepSeek Harness 运行时<br/>session/event · agent/pre-step"] --> HARN
+  HARN --> CORE
+  ENTRY --> HARN
+```
+
+*图注：依赖方向单向——harness 依赖 core，core 不依赖任何 DSH 运行时；新增能力一律「core 纯领域 + harness 薄适配 + Config 开关」三步装配，未启用时零回归。*
+
+目录结构：
 
 ```
 src/
@@ -436,59 +625,26 @@ scripts/smoke.mjs  冒烟测试（真实 lib 产物 + 真实 cordis Context，17
 
 数据流：
 
+
+```mermaid
+flowchart LR
+  EV["session/event<br/>request/header + message.usage"] --> LIST["listener.ts<br/>解析 + 选带计价"]
+  LIST --> MET["Meter / WindowMeter<br/>四维累计 + 日/月窗口"]
+  MET --> TRA["CostTrail + MadDetector<br/>轨迹采样 + 尖峰检测"]
+  TRA --> FCTX["buildForecastContext<br/>投影 / 尖峰 / 预检估算"]
+  FCTX --> GOV["buildGovernorInput<br/>月→日额度 / 背压 / 动态水位"]
+  GOV --> GR["guard.ts<br/>agent/pre-step 决策"]
+  GR -->|"熔断"| REJ["拒绝 + 取消"]
+  GR -->|"告警 / 放行"| NEXT["next() 放行"]
+  GR -->|"onViolation"| AI["alert-explain<br/>告警根因叙事（0.15.0）"]
+  MET --> PANEL["cost_guard_status 工具<br/>+ ctx.costGuard 服务"]
+  LIST -.-> FR["frontier<br/>FOCUS / OTel / 单位经济 / 杠杆"]
+  LIST -.-> RTX["reasoning-tax / reasoning-tax-audit<br/>思考税账本 + 双切片审计"]
 ```
-session/event ──► listener.ts ──► Meter/WindowMeter（实时累计）
-                        │
-                        ├──► CostTrail + MadDetector（轨迹采样 + 尖峰检测）
-                        │
-                        └──► frontier.ts record（0.12.0）──► focus-ledger（FOCUS 台账 JSONL）
-                                                                  ├──► otel-genai（GenAI span / trace 关联）
-                                                                  └──► unit-economy + leverage（单位经济学 / 杠杆洞察）
-                        │
-        ――――――――――――――――――――――――┘
-        ▼ 预测引擎（forecast.ts / anomaly.ts）
-   buildForecastContext（投影 / 尖峰 / 预检估算）
-        │
-        ▼ 自适应调节器（governor.ts）
-   buildGovernorInput（月→日额度 / 背压 / 结转 / 动态水位）
-        │
-agent/pre-step ◄─ guard.ts ◄── BudgetEvaluator（水位 + 预测式策略 + 自适应策略）
-      ▾  reject + cancel              │
-   模型请求被阻断                 cost_guard_status 工具 / ctx.costGuard 服务
-                                     （forecast + adaptive + efficiency + frontier 段）
-                                     │
-        ── explain.ts（0.14.0）◄──── meter.snapshot()（会话/路由账本 + 基线快照）
-              ├─► rca.ts 双视角增量贡献分解（current / delta Δ 基线归因）
-              ├─► 中文可解释叙事（总览/根因因子/缓存/输出/路由建议）
-              └─► cost_guard_explain 只读工具（Agent 自助诊断）
-              │
-        onViolation（guard 告警/熔断触发）
-              └─► alert.ts（0.15.0）──► 告警根因叙事（core/alert-explain.ts，零 DSH）
-                    ├─► 首句答「为什么告警」（scope/水位/Δ）+ 会话/路由主因 + 建议
-                    ├─► explain.alert.enabled 时追加 `告警根因：` 日志行（可转发 IM）
-                    └─► onExplainAlarm 宿主回调（抛错自动降级不影响熔断主流程）
 
-        tenant.enabled=true（0.16.0）
-              └─► tenant.ts ◄──── meter.snapshot()（会话账本）
-                    ├─► 租户解析（mapping>prefix>regex，未命中兜底内置 'default'）
-                    ├─► 租户聚合 + 租户间归因（复用 rca 增量贡献分解，主因/次因/噪声）
-                    ├─► 租户内主因会话两级证据链 + 中文叙事（core/tenant.ts）
-                    └─► cost_guard_tenant 只读工具 + cost_guard_status 面板 tenant 段
+*图注：实线为主计量/熔断主链路；虚线为可选模块挂在 sampler 钩子上的旁路能力，未启用时 runtime 整体 undefined、输出与上一版本完全一致（零回归）。*
 
-        reasoningTax.enabled=true（0.17.0）
-              └─► reasoning-tax.ts ◄── sampler（entry）
-                    ├─► 路由归因账本（推理 token / 可见输出 / 税成本 + taxRatio + 主因）
-                    ├─► 独立推理税预算水位（budget ok/warn/block，limit>0 时）
-                    ├─► 中文治理叙事（思考预算压缩 / 路由降级 / 切换非推理模型）
-                    └─► cost_guard_reasoning 只读工具 + 面板 reasoningTax 段
 
-        reasoningTaxAudit.enabled=true（0.18.0）
-              └─► reasoning-tax-audit.ts ◄── sampler（entry, sessionId）
-                    ├─► 会话维度 Top N 排行（sessionTopN，主因会话 + 占全局比例）
-                    ├─► 时间热力桶（bucketMinutes × heatBuckets，热力序列 + 峰值桶）
-                    ├─► 中文审计叙事（会话收敛 / 热点错峰 / 时段预算护栏）
-                    └─► cost_guard_reasoning_audit 只读工具 + 面板 reasoningTaxAudit 段
-```
 
 ## 二次开发
 
@@ -511,6 +667,8 @@ npm pack           # 发布包预检
 - 扩展推理税治理/审计：新增归因维度（如按任务/按周）先在 `core/reasoning-tax*.ts` 实现纯领域账本（零 DSH，追加同一 entry 互不读写），再在 `harness/reasoning-tax*.ts` 注册 runtime（`append` 入账 + `panel` 段 + 只读工具 + `format*Lines` 人读行），最后在 `index.ts` 的 `reasoningTax*` schema 加配置，未启用时零回归。
 - 持久化：`core/store.ts` 定义 `CostSnapshot` 形状（含 `bands` 分带分布）；接入 `ctx.costGuard` 服务即可跨重启恢复。
 
+
+
 ## 与现有方案对比
 
 | 方案 | 形态 | 实时性 | 阻断能力 | 进程内 | 事前治理 | 动态预算 |
@@ -519,6 +677,8 @@ npm pack           # 发布包预检
 | Token Monitor | 外部桌面工具 | 弱（外挂采集） | 无 | 否 | 无 | 无 |
 | OTel / 按量计费网关 | 外部上报链路 | 中（链路延迟） | 无/网关级 | 否 | 无 | 无 |
 | **dsh-cost-guard** | **原生插件** | **逐 token 调用计量** | **请求前熔断** | **是** | **预测外推 + 请求预检 + 尖峰检测** | **月→日额度派生 + 预测背压 + 跨周期结转** |
+
+
 
 ## 版本演进
 
@@ -542,6 +702,12 @@ npm pack           # 发布包预检
 | **0.12.0** | **前沿套件（Frontier Suite）：对齐世界前沿标准把成本治理升级为可观测 + 可对账成本套件——FOCUS 成本台账（FinOps Foundation v1.2 Dimension/Metric 列规格，标准行 + 4096 行缓冲 + sink 逐行 JSONL 流出，可流入任意 FinOps 工具）、OTel GenAI 遥测（OpenTelemetry GenAI Semantic Conventions 标准 span 属性 + FNV-1a/稳定十六进制 trace·会话关联 ID + sink 流出，可进 Prometheus/Jaeger/Grafana 等可观测性栈）、单位经济学与成本归属（每请求/每百万 token 成本、Top-N 会话份额，FinOps for GenAI Showback 到业务单元）、成本杠杆洞察（缓存折扣杠杆：读取价 vs 输入价差倍数/已省率/可再省率；输出杠杆：价差倍数/占比/压缩 10% 可省）；全部默认关闭、core 零 DSH，未启用时与 0.11.0 行为完全一致（零回归），单测 246→287，冒烟保持 12 节** |
 | **0.14.0** | **成本根因解释（Explainable Cost RCA）：从「知道超了」到「知道为什么」——市面成本方案止步于统计与归因（Snowflake 官方博客：knowing that an anomaly occurred is only half the battle），0.14.0 新增证据化成本根因分析（core/rca.ts：会话/路由双视角增量贡献分解，主因/次因/噪声分级，Δ 与基线对比归因，topN 截断防长尾刷屏）、可解释成本叙事（core/explain.ts：中文总览/根因因子句/可执行建议，缓存杠杆/输出压缩/路由替代建议）；注册只读工具 cost_guard_explain（Agent 自助「为什么成本涨了」+ 双模式 current/delta 增量归因）；默认关闭零回归（未启用与 0.13.0 完全一致）、core 零 DSH 保持；单测 319→349、覆盖率门禁保持（全局 stmts 97.25%/branch 86.94%、store.ts 100%）、tsc exit 0、ESLint 0、build 成功、冒烟 12→13 节全过** |
 | **0.13.0** | **全量代码质量进化（Quality Evolution）：TS 5 项严格选项全开（exactOptionalPropertyTypes / noPropertyAccessFromIndexSignature / noFallthroughCasesInSwitch / noImplicitOverride / noUncheckedSideEffectImports）并清零类型错误；接入 typescript-eslint strictTypeChecked 静态检查（88 项违规归零，含 2 项有据取舍：跨边界防御式空值回退保留为准、数字模板插值放行 allowNumber）；新增 lint/coverage/quality 工程脚本与覆盖率门禁（全局 stmts≥90%/branch≥85%、store.ts 100%）；补测 45 个新用例（快照持久化/入口集成/数值统计/杠杆边界）；319 单测全绿、tsc exit 0、build 成功、冒烟 12 节全过，core 零 DSH 与零回归不变量保持** |
+
+
+
+<details>
+<summary>各版本深度要点（0.5–0.12，点击展开）</summary>
+
 
 **0.12.0 前沿套件要点（全部保持未启用新配置时与 0.11.0 行为完全一致，零回归）：**
 
@@ -607,6 +773,9 @@ npm pack           # 发布包预检
 2. **预测驱动的水位不是拍脑袋阈值**：静态 `warnAt/hardAt` 对所有人一刀切；0.5.0 的告警/阻断水位由当月消费速率与剩余天数实时计算，越接近月末、预测越险，水位自动下探，等于「预算越紧张，防线越靠前」。
 3. **省下来的能结转，而不是归零清零**：本月末未用完 × `carryOverRatio` 结转为次月 `carriedIn` 可用池，持续"奖励"节约行为，解决"月底不敢用、月初没得用"的周期性浪费。
 4. **从"花了多少"到"花得值不值"**：每千输出 token 成本把质量与成本挂钩（输出是推理质量的载体），请求成本分布暴露长尾拖累，路由替代估算直接给出行得通的省钱动作，而非一句"请控制用量"。
+
+
+</details>
 
 ## License
 
