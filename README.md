@@ -1,6 +1,6 @@
 # dsh-cost-guard
 
-**DeepSeek Harness 原生「实时成本治理」插件** —— 用量实时计量、多维度预算、熔断防护、成本面板、预测式治理与自适应调节，全部在 Harness 进程内完成。
+**DeepSeek Harness 原生「实时成本治理」插件** —— 用量实时计量、多维度预算、熔断防护、成本面板、预测式治理与自适应调节、官方计价深度同步、成本根因解释、多租户成本视图、推理成本专项治理与多维思考税审计，全部在 Harness 进程内完成。
 
 > 市面现有方案（whale-report 等）全是**事后形态**：跑完一轮才出报告，超支发生后才告诉你。`dsh-cost-guard` 是第一款**原生实时治理插件**：在 `agent/pre-step` 阶段拦下超预算的下一步请求，从源头上阻止模型继续烧钱。
 >
@@ -27,6 +27,10 @@
 > 0.15.0 把「知道为什么」推进到告警现场 —— **根因解释接入告警通知（Explainable Alarm）**：市面成本告警只会喊「超了」（水位数字 + scope），不解释「为什么超、主因是谁、下一步怎么办」。0.15.0 在 Guard 告警/熔断触发时，同一条通知输出**告警根因叙事**（`core/alert-explain.ts`，零 DSH）——scope/水位/Δ + 会话/路由双视角主因（各 1 条，避免刷屏）+ 可执行建议（输出压缩 / 缓存杠杆 / 调用频率检查），单段纯文本与逐行两种格式，可直接转发 IM / 桌面通知；首次触发存量归因并沉淀基线，后续触发与告警前基线对比增量归因（回答「这次为什么超」）；宿主可挂 `onExplainAlarm` 回调取结构化负载（回调抛错自动降级，不影响熔断主流程）。**默认关闭零回归**，未启用时行为与 0.14.0 完全一致；core 层零 DSH 保持。
 >
 > 0.16.0 回答企业最关心的第三问 —— **多租户成本解释视图（Multi-Tenant Cost Explanation View）**：市面成本方案（LiteLLM / C1.ai / Azure / Snowflake）的成本归因止步于「会话 / 路由」两个记账维度（任务视角 / 模型视角），都没有回答「**钱是哪个团队 / 项目 / 工作区花的**」。DeepSeek Harness 常被多个租户共用同一实例，成本混在同一个 Meter 账本里。0.16.0 新增 `core/tenant.ts`（零 DSH）补齐**租户维度**：sessionId → 租户解析器（mapping 精确映射 / prefix 前缀映射 / regex 正则提取，未命中兜底内置 `'default'`）+ 租户聚合（四通道金额与 Token 全量带入）+ **租户间归因**（复用 rca.ts 增量贡献分解，无基线退化为存量构成，主因/次因/噪声分级）+ **租户内解释**（对主因租户再做会话视角归因，输出「租户为什么烧钱 → 该租户哪个会话在烧钱」**两级证据链**）+ 中文叙事；只读工具 `cost_guard_tenant` 供 Agent 自助查询「哪个租户在烧钱」。**默认关闭零回归**，未启用时行为与 0.15.0 完全一致；core 层零 DSH 保持。
+>
+> 0.17.0 把成本治理推进到推理 token 专项 —— **推理成本专项治理（Reasoning Tax Governance）**：市面 DSH 成本插件（dsh-billing / dsh-cost-meter / dsh-cost-tracker 等）只统计输入 / 输出 / 缓存三通道，无人按推理 token（思维链 / thinking）专项计量与治理；而 2026 年行业共识指出推理 token 按输出价计费、常为可见输出的 **5~20 倍**，是账单里最大的隐藏成本（「思考税」）。0.17.0 把它从「展示项」升级为「**可治理对象**」——独立账本按路由聚合推理 token / 可见输出，按输出价估算税成本与思考税占比（`core/reasoning-tax.ts`，零 DSH）+ **独立推理税预算**水位 ok / warn / block（纯新增治理维度，不干预既有 budgets 熔断语义）+ 中文治理叙事（思考预算压缩 / 路由降级 / 切换非推理模型）+ 只读工具 **`cost_guard_reasoning`**。**默认关闭零回归**，未启用时行为与 0.16.0 完全一致；core 层零 DSH 保持。
+>
+> 0.18.0 在路由归因之上再切两刀 —— **多维思考税审计（Multi-Dimension Reasoning Tax Audit）**：0.17.0 回答了「哪条路由在烧思考税」，但还缺两问——「**哪个会话在烧**」与「**什么时候在烧**」。0.18.0 新增**会话维度 Top N 排行（默认 Top 5）+ 时间热力桶（默认 60 分钟 × 最近 24 桶）**双切片审计账本（`core/reasoning-tax-audit.ts`，零 DSH，与路由账本正交、互不读写）——输出主因会话、热力峰值时段及其占全局推理的比例，并给**中文审计叙事**（会话思考预算收敛 / 热点错峰 / 时段预算护栏）+ 只读工具 **`cost_guard_reasoning_audit`**（市面无同类工具）。**默认关闭零回归**，未启用时行为与 0.17.0 完全一致；core 层零 DSH 保持。
 
 ---
 
@@ -104,7 +108,17 @@ DeepSeek Harness（DSH）是官方开源的 Agent Harness（"一切皆插件"，
   - **租户解析器（`core/tenant.ts`，零 DSH）**：`tenantResolverOf` 按「mapping 精确映射 > prefix 前缀映射 > regex 正则提取」三级规则把 sessionId 归到租户，未命中任一级兜底内置 `'default'`，完全由调用方配置、不侵占用例元数据；`aggregateTenantBuckets` 把会话桶按租户归并（金额 / Token 四通道全量带入，纯加和）；
   - **租户间归因 + 租户内两级证据链（`core/tenant.ts`）**：`analyzeTenantRca` 复用 rca.ts 增量贡献分解——**租户间**标识主因/次因/噪声租户（无基线退化为存量构成归因、有基线按 Δ 分解贡献），对主因租户再对其内部会话做一次会话视角归因，输出「租户为什么烧钱 → 该租户哪个会话在烧钱」的两级证据链；`buildTenantExplanation` 输出中文叙事（总览/因子句/建议）；
   - **只读诊断工具 `cost_guard_tenant`（`harness/tenant.ts`）**：Agent 可自助提问"**哪个租户在烧钱**"，返回结构化租户报表 + 中文叙事（`current` 存量归因 / `delta` 与上次查询增量归因双模式）；`cost_guard_status` 面板新增 `tenant` 段、摘要新增多租户行；未配置时整体缺省（行为与 0.15.0 完全一致）。
-- **成本面板**：注册只读工具 `cost_guard_status`（模型可调用）与 `CostGuardService`（`ctx.costGuard`，其他插件可注入），并暴露人读摘要。0.4.0 起工具/摘要新增 `forecast` 段（今日/月末投影、置信区间、尖峰级别、预测式触发明细）；0.5.0 起新增 `adaptive` 段（动态额度/剩余/背压/动态水位/结转/cue）与 `efficiency` 段（每千输出成本、请求分布、替代节约建议）；0.12.0 起新增 `frontier` 段（FOCUS 行数 / OTel span 数 / 单位经济学 / 杠杆洞察）；0.14.0 起新增 `explain` 段（成本根因报表 + 中文叙事，`explain.enabled=true` 时）；0.16.0 起新增 `tenant` 段（多租户成本解释报表 + 两级证据链中文叙事，`tenant.enabled=true` 时）。
+- **推理成本专项治理（0.17.0 新增，默认关闭，零回归）**：把思维链「思考税」从**展示项**升级为**可治理对象**——独立于金额预算的推理 token 专项治理维度，回答"推理（思考）token 花了多少 / 在哪里烧 / 怎么省"——
+  - **思考税账本（`core/reasoning-tax.ts`，零 DSH）**：按路由聚合推理 token / 可见输出 / 推理成本（推理 token × 输出价），输出全局与逐路由思考税占比（`taxRatio` = 推理 ÷（推理 + 可见输出））与主因路由识别——2026 行业共识：推理 token 按输出价计费、常为可见输出的 5~20 倍，是账单最大的隐藏成本（市面 DSH 成本插件 dsh-billing / dsh-cost-meter / dsh-cost-tracker 均无此专项）；
+  - **独立推理税预算（`reasoningTax.budget`）**：`limit` + `warnAt` / `hardAt` → 水位 **ok / warn / block**——纯新增治理维度，不干预既有 budgets 熔断语义；`limit > 0` 才启用水位判定，未配置预算仅做洞察展示（无水位判定）；
+  - **中文治理叙事（summary / factor / suggestion）**：思考税花在哪（主因 / 次因路由）、怎么省——思考预算压缩（`thinking_budget` / `max_tokens`）、路由降级、切换非推理模型，并可提示「为推理税单独设置预算」；
+  - **只读诊断工具 `cost_guard_reasoning`（`harness/reasoning-tax.ts`）**：Agent 可自助"**推理 token 花了多少 / 为什么 / 怎么省**"，返回结构化思考税报表（逐路由聚合 / taxRatio / 税成本 / 预算水位）+ 证据 + 建议；面板 `reasoningTax` 段并入 `cost_guard_status`。
+- **多维思考税审计（0.18.0 新增，默认关闭，零回归）**：在 0.17.0 路由归因之上新增「**会话 Top N + 时间热力桶**」双切片审计，回答"哪个会话在烧思考税 / 一天中何时烧得最集中"——
+  - **会话维度 Top N 排行（`core/reasoning-tax-audit.ts`，零 DSH）**：按 sessionId 聚合推理 token / 可见输出 / 税成本，输出 Top N 会话排行（默认 `sessionTopN` 5）与主因会话及其占全局推理的比例——定位"谁的思考链最贵"；
+  - **时间热力桶**：按固定时长桶（`bucketMinutes` 默认 60 分钟）聚合推理 token 与税成本，保留最近 `heatBuckets`（默认 24）个桶，输出热力序列（按开始时刻升序）与热力峰值桶——定位"思考税在一天中何时集中"；
+  - **中文审计叙事**：主因会话 / 热力峰值 / 占全局推理比例 + 治理建议（会话思考预算收敛 / 热点错峰拆分 / 为高峰时段设置独立推理税预算护栏）；
+  - **只读诊断工具 `cost_guard_reasoning_audit`（`harness/reasoning-tax-audit.ts`）**：Agent 可自助"**哪个会话在烧思考税 / 怎么收**"，返回会话 Top N 排行 + 热力序列 + 证据 + 建议（市面无同类工具）；面板 `reasoningTaxAudit` 段并入 `cost_guard_status`。
+- **成本面板**：注册只读工具 `cost_guard_status`（模型可调用）与 `CostGuardService`（`ctx.costGuard`，其他插件可注入），并暴露人读摘要。0.4.0 起工具/摘要新增 `forecast` 段（今日/月末投影、置信区间、尖峰级别、预测式触发明细）；0.5.0 起新增 `adaptive` 段（动态额度/剩余/背压/动态水位/结转/cue）与 `efficiency` 段（每千输出成本、请求分布、替代节约建议）；0.12.0 起新增 `frontier` 段（FOCUS 行数 / OTel span 数 / 单位经济学 / 杠杆洞察）；0.14.0 起新增 `explain` 段（成本根因报表 + 中文叙事，`explain.enabled=true` 时）；0.16.0 起新增 `tenant` 段（多租户成本解释报表 + 两级证据链中文叙事，`tenant.enabled=true` 时）；0.17.0 起新增 `reasoningTax` 段（思考税报表 + 预算水位，`reasoningTax.enabled=true` 时）；0.18.0 起新增 `reasoningTaxAudit` 段（会话 Top N + 时间热力报表 + 中文审计叙事，`reasoningTaxAudit.enabled=true` 时）。
 - **价格覆盖**：内置 DeepSeek 官方价（`deepseek-chat` / `deepseek-reasoner`），支持按 `provider/model` 或裸 `model` 覆盖，未识别路由走保守兜底价。
 - **安全默认**：默认 `mode=block` 硬熔断 + `cancelOnBlock=true`；想纯观察可 `mode=off`（只计量不干预）。预测式治理与自适应调节默认不配置 = 行为与 0.3.0 完全一致。
 
@@ -240,6 +254,28 @@ plugins:
         # prefix: { 'team-a-': 'team-a' }         # 前缀映射（次优先级，最长前缀优先）
         # regex: { source: '^team-(?:[a-z]+)', flags: '' }  # 正则提取（最低优先级），取首个捕获组或全匹配
         # 未命中任一级规则的会话兜底归 defaultTenant（内置默认 'default'）
+    # 推理成本专项治理（0.17.0，可选；不配置则行为与 0.16.0 完全一致）
+    # - 独立账本按路由聚合推理 token / 可见输出，按输出价估算「思考税」
+    #   （推理 token 常为可见输出 5~20 倍，是账单最大隐藏成本）
+    # - 中文治理叙事：思考预算压缩 / 路由降级 / 切换非推理模型
+    # - 只读工具 cost_guard_reasoning：Agent 自助「推理 token 花了多少 / 怎么省」
+    reasoningTax:
+      enabled: false          # 默认关闭；置 true 启用推理成本专项治理
+      # budget（可选）：独立推理税预算（limit 金额 / warnAt 0~1 / hardAt 0~1）
+      # - limit > 0 才启用 ok/warn/block 水位判定；未配置 budget 仅做洞察展示
+      # budget: { limit: 50, warnAt: 0.8, hardAt: 1 }
+    # 多维思考税审计（0.18.0，可选；不配置则行为与 0.17.0 完全一致）
+    # - 在 0.17.0 路由归因之上新增「会话 Top N + 时间热力桶」双切片：
+    #   哪个会话在烧思考税 / 一天中何时烧得最集中
+    # - bucketMinutes：时间桶时长（分钟，默认 60）
+    # - heatBuckets：热力序列保留的最近桶数（默认 24）
+    # - sessionTopN：会话排行保留条数（默认 5）
+    # - 只读工具 cost_guard_reasoning_audit：Agent 自助「哪个会话在烧 / 何时集中」
+    reasoningTaxAudit:
+      enabled: false          # 默认关闭；置 true 启用多维思考税审计
+      # bucketMinutes: 60
+      # heatBuckets: 24
+      # sessionTopN: 5
     fallbackProvider: deepseek
     fallbackModel: deepseek-chat
     enableTool: true
@@ -266,6 +302,22 @@ plugins:
 | `frontier` | object | 未配置 | 前沿套件（0.12.0，可选）：`focus`（`{ enabled: false, sink? }`，FOCUS 标准成本台账，4096 行缓冲 + JSONL 行流出回调）、`otel`（`{ enabled: false, sink? }`，OTel GenAI 语义 span 遥测，trace/会话关联 + 行流出回调）、`unitEconomy`（bool，单位经济学：每请求/每百万 token 成本 + Top-N 会话成本归属与份额，Showback 到业务单元）、`leverage`（bool，成本杠杆洞察：缓存折扣杠杆——读取价 vs 输入价差倍数/已省率/可再省率，输出杠杆——输出价差倍数/成本占比/压缩 10% 可省）；不配置或全 false 则与 0.11.0 行为一致 |
 | `explain` | object | 未配置 | 成本根因解释（0.14.0，可选）：`enabled`（默认 false）；启用后注册只读工具 `cost_guard_explain` 并在 `cost_guard_status` 面板新增 `explain` 段——会话/路由双视角增量贡献分解 + 主因/次因/噪声分级（rca.ts）+ 中文可解释叙事（总览/根因因子句/缓存与输出杠杆/路由替代建议，explain.ts）+ Agent 自助诊断（current 存量 / delta 与上次查询增量双模式）；0.15.0 起支持子配置 `alert`（`{ enabled: false, onExplainAlarm? }`，需 `enabled=true`）：Guard 告警/熔断触发时同一条通知输出告警根因叙事（scope/水位/Δ + 会话/路由主因 + 建议，可转发 IM），首次触发存量归因并沉淀基线、后续与告警前基线增量归因，`onExplainAlarm` 宿主回调可收结构化负载（抛错自动降级）；不配置则与 0.13.0 行为一致 |
 | `tenant` | object | 未配置 | 多租户成本解释视图（0.16.0，可选）：`enabled`（默认 false）；启用后注册只读工具 `cost_guard_tenant` 并在 `cost_guard_status` 面板新增 `tenant` 段——sessionId→租户解析器（`resolve`: `mapping` 精确映射 > `prefix` 前缀映射 > `regex`（`{ source, flags? }`）正则提取，未命中任一级兜底 `'default'`）→ 租户聚合（四通道金额/Token）→ 租户间归因（复用 rca.ts 增量贡献分解，无基线退化为存量构成，主因/次因/噪声分级）+ 租户内会话两级证据链（主因租户内哪个会话在烧钱）+ 中文叙事（total/overview/factors/suggestion）+ Agent 自助诊断（current 存量 / delta 与上次查询增量双模式）；不配置或 `enabled=false` 则与 0.15.0 行为一致 |
+| `reasoningTax` | object | 未配置 | 推理成本专项治理（0.17.0，可选）：`enabled`（默认 false）；启用后注册只读工具 `cost_guard_reasoning` 并在 `cost_guard_status` 面板新增 `reasoningTax` 段——按路由聚合推理 token / 可见输出 / 推理成本（推理 token × 输出价，`taxRatio` 思考税占比与主因路由识别）、独立推理税预算水位（`budget`: `limit`/`warnAt`/`hardAt`，limit>0 才启用 ok/warn/block 水位，未配置预算仅洞察展示）+ 中文治理叙事（思考预算压缩 / 路由降级 / 切换非推理模型）；纯新增维度不干预既有 budgets 熔断语义；不配置或 `enabled=false` 则与 0.16.0 行为一致 |
+| `reasoningTaxAudit` | object | 未配置 | 多维思考税审计（0.18.0，可选）：`enabled`（默认 false）；启用后注册只读工具 `cost_guard_reasoning_audit` 并在 `cost_guard_status` 面板新增 `reasoningTaxAudit` 段——会话维度 Top N 排行（`sessionTopN` 默认 5，范围 1~50，主因会话 + 占全局推理比例）+ 时间热力桶（`bucketMinutes` 默认 60 分钟，范围 1~1440，保留最近 `heatBuckets` 默认 24 桶、范围 1~168，热力序列 + 峰值桶）+ 中文审计叙事（会话思考预算收敛 / 热点错峰 / 时段预算护栏）；与 0.17.0 路由归因账本正交；不配置或 `enabled=false` 则与 0.17.0 行为一致 |
+
+### 配置分层：必填项与自动最优
+
+本插件按「最大限度自动最优」设计——绝大多数配置项都带安全默认值，**真正必须由用户填写的只有预算金额**：
+
+- **必填（无默认可替，不填则无治理意义）**：`budgets.*.limit`（推荐至少配置 `month`）。`limit <= 0` 的预算维度不参与熔断与告警（core 层直接跳过），插件此时只计费、不干预；填一个上限即进入完整治理态。
+- **条件必填（启用对应功能时才需要）**：
+  - `pricing` 价格覆盖：仅当使用官方注册表（102 条）之外的模型时才需手填三通道价；官方模型自动使用官方价目，用户覆盖始终优先；
+  - `tzOffsetMin`：默认 480（东八区），跨时区部署才需要调整（影响日/月窗口切分与峰谷判定）；
+  - `tenant.resolve`：启用多租户归因后，若要正确归属「哪个团队/项目/工作区」，需提供 sessionId → 租户解析规则，未命中任一级兜底 `'default'`；
+  - `predictive.projections`：启用预测式治理时选择投影目标（如 `day`/`month`），未配置 limit 的 scope 自动跳过预检。
+- **自动最优（零配置即为最优默认）**：安全护栏默认 `mode=block` + `cancelOnBlock=true`；`officialPricing.enabled: true` 一键接入官方 102 条价目、峰谷/节假日自动判定与别名归一，无需手填价目；各模块内部参数均带代码注入默认值——`adaptive`（`reserveRatio 0.1` / `backpressure 0.5` / `floorRatio 0.3` / `carryOverRatio 1`）、`reasoningTax`（`warnAt 0.8` / `hardAt 1`）、`reasoningTaxAudit`（`sessionTopN 5` / `bucketMinutes 60` / `heatBuckets 24`）、`cache.hint`（`minRepeat 3` / `minSaving 0.50`）；`predictive`/`adaptive`/`cache`/`frontier`/`explain`/`tenant`/`reasoningTax`/`reasoningTaxAudit` 默认全关、零回归，不会因升级产生意外干预。
+
+> 落地形态建议：可视化配置页仅需「必填表单层」（预算上限，可选展开今日/会话/总额与告警水位）+「功能开关层」（各模块一句话说明、默认关闭、开启即用最优参数），高级参数（`priceOverride`、`tenant.resolve` 等）折叠在「高级」区。
 
 ## 使用效果
 
@@ -319,6 +371,14 @@ plugins:
   - `cost_guard_status` 返回结构新增 `tenant` 段：`window` + `report`（`byTenant` 主因/次因/噪声分级 + `details` 各租户内 `topSessions` 主因会话证据链 + `tenantCount`/`totalCost`/`baselineTotalCost`/`deltaCost`/`deltaRatio`）+ `enabled`；
   - 摘要新增多租户行：`多租户视图: 3 个租户 · 当前累计 12.34 · 主因租户 team-a 占 61% · 其主因会话 team-a/s1`（`tenant.enabled=true` 时）；启动摘要追加 `+ 多租户成本视图`；
   - 未配置 `tenant` 时输出与 0.15.0 完全一致（无租户工具 / 无 tenant 段 / 无多租户行），零回归。
+- 推理成本专项治理（0.17.0）：配置 `reasoningTax.enabled=true` 后——
+  - 注册只读工具 `cost_guard_reasoning`：Agent 可自助追问「推理（思考）token 花了多少 / 在哪里烧 / 怎么省」，返回**结构化思考税报表 + 中文叙事**（按路由聚合推理 token / 可见输出 / 税成本、思考税占比、独立推理税预算水位与治理建议）；
+  - `cost_guard_status` 返回结构新增 `reasoningTax` 段：`window`（current）+ `report`（`totalReasoningTokens` / `totalOutputTokens` / `totalTaxCost` / `taxRatio` / `pricedRoutes` / `byRoute`（route/requests/reasoningTokens/outputTokens/taxCost）+ `dominant` 主因路由 + `budget`（limit/spent/ratio/level: ok/warn/block，配置 budget 且 limit>0 时出现））；
+  - 摘要新增思考税治理行：`推理税治理: 推理 3,000,000 tokens（思考税 88% · 估算 12.00） · 主因路由 deepseek/deepseek-chat（配置 budget 时追加 ` · 推理税预算 45%（ok）`）`；Agent 工具输出 `summary` + `narrative`（中文总览/因子句/建议）人读叙事。
+- 多维思考税审计（0.18.0）：配置 `reasoningTaxAudit.enabled=true` 后——
+  - 注册只读工具 `cost_guard_reasoning_audit`：Agent 可自助追问「哪个会话在烧思考税 / 一天中何时烧得最集中 / 怎么收」，返回**会话 Top N 排行 + 时间热力序列 + 中文审计叙事**；
+  - `cost_guard_status` 返回结构新增 `reasoningTaxAudit` 段：`window`（current）+ `sessionTopN` / `heatBuckets` + `report`（`totalReasoningTokens` / `totalOutputTokens` / `totalTaxCost` / `taxRatio` / `sessionRequests` / `sessions`（key/requests/reasoningTokens/outputTokens/taxCost，Top N 按税成本降序）+ `heat`（start/end/…，按开始时刻升序、最多 heatBuckets 个桶）+ `dominantSession` 主因会话 + `dominantBucket` 热力峰值桶）；
+  - 摘要新增审计行：`推理税审计: 推理 3,000,000 tokens（思考税 88% · 估算 12.00） · 主因会话 session-1 · 热力峰值 09:00 起 1h`（会话数 >1 时追加降序排行行）；Agent 工具输出 `summary` + `narrative` + `explanation`（中文审计叙事 + 治理建议）。
 
 ## 架构
 
@@ -351,6 +411,8 @@ src/
     explain.ts       可解释成本叙事（0.14.0：中文总览/根因因子句/可执行建议——缓存命中杠杆、输出压缩杠杆、路由替代提示）
     alert-explain.ts 告警根因叙事（0.15.0：告警信号 + 根因报表 → 告警专属中文叙事，首句答「为什么告警」+ 会话/路由主因 + 建议收敛，单段/逐行双格式；零 DSH）
     tenant.ts       多租户成本解释视图（0.16.0：sessionId→租户解析器（mapping>prefix>regex，未命中兜底内置 'default'）+ 租户聚合（四通道全量）+ 租户间归因（复用 rca 增量贡献分解，主因/次因/噪声分级）+ 租户内主因会话两级证据链 + 中文叙事；纯函数/JSON 安全/零 DSH）
+    reasoning-tax.ts 推理成本专项治理账本（0.17.0：按路由聚合推理 token / 可见输出 / 税成本（推理 token × 输出价）+ 全局与逐路由思考税 taxRatio + 主因路由识别 + 独立推理税预算水位 ok/warn/block + 中文叙事；纯函数/无副作用/零 DSH）
+    reasoning-tax-audit.ts 多维思考税审计账本（0.18.0：会话维度 Top N 排行（默认 5）+ 时间热力桶（默认 60 分钟 × 24 桶）双切片聚合推理 token / 税成本，主因会话 + 热力峰值桶 + 中文审计叙事；与路由账本正交/零 DSH）
     budget.ts    预算决策引擎（纯函数；0.4.0 预测式策略 projection/spike/preflight；0.5.0 自适应 adaptive 策略）
     store.ts     快照持久化契约
   harness/     # 薄适配层（唯一接触 DSH API 的地方）
@@ -363,11 +425,13 @@ src/
     explain.ts    成本根因解释适配（0.14.0：ExplainRuntime——current/delta 双模式 + 基线快照、panel 面板负载、cost_guard_explain 工具注册、formatExplainLines 人读根因行）
     alert.ts      告警根因解释适配（0.15.0：attachAlertExplain——Guard 决策投影告警信号 + ExplainRuntime 基线语义、onViolation 后追加告警根因叙事、onExplainAlarm 宿主回调 + 抛错降级、formatAlarmPanelLines/formatAlarmLines 告警行）
     tenant.ts      多租户成本解释适配（0.16.0：TenantRuntime——current/delta 双模式 + 基线快照、panel 面板负载、cost_guard_tenant 只读工具注册、formatTenantLines 人读多租户行）
-    tool.ts       cost_guard_status 工具 + 人读摘要（当前时段/生效单价/分带分布/预测尖峰/自适应/效率/缓存/前沿/租户）
+    reasoning-tax.ts 推理成本专项治理适配（0.17.0：ReasoningTaxRuntime——思考税账本 + 独立预算水位、panel 面板负载、cost_guard_reasoning 只读工具注册、formatReasoningTaxLines 人读思考税行）
+    reasoning-tax-audit.ts 多维思考税审计适配（0.18.0：ReasoningTaxAuditRuntime——会话 Top N + 时间热力双切片账本、panel 面板负载、cost_guard_reasoning_audit 只读工具注册、formatReasoningTaxAuditLines 人读审计行）
+    tool.ts       cost_guard_status 工具 + 人读摘要（当前时段/生效单价/分带分布/预测尖峰/自适应/效率/缓存/前沿/租户/推理税/思考税审计）
   index.ts      插件装配（Config / apply）
   service.ts    CostGuardService 契约（inject 给其他插件）
-tests/         单元测试（vitest，388 用例：369 存量 + 多租户成本解释视图 19（tenant 11 + harness-tenant 5 + 入口集成 3））
-scripts/smoke.mjs  冒烟测试（真实 lib 产物 + 真实 cordis Context，14 节）
+tests/         单元测试（vitest，419 用例：369 存量 + 多租户成本解释视图 19 + 推理成本专项治理与多维思考税审计 31（reasoning-tax 8 + harness-reasoning-tax 8 + reasoning-tax-audit 9 + harness-reasoning-tax-audit 6））
+scripts/smoke.mjs  冒烟测试（真实 lib 产物 + 真实 cordis Context，17 节）
 ```
 
 数据流：
@@ -410,6 +474,20 @@ agent/pre-step ◄─ guard.ts ◄── BudgetEvaluator（水位 + 预测式策
                     ├─► 租户聚合 + 租户间归因（复用 rca 增量贡献分解，主因/次因/噪声）
                     ├─► 租户内主因会话两级证据链 + 中文叙事（core/tenant.ts）
                     └─► cost_guard_tenant 只读工具 + cost_guard_status 面板 tenant 段
+
+        reasoningTax.enabled=true（0.17.0）
+              └─► reasoning-tax.ts ◄── sampler（entry）
+                    ├─► 路由归因账本（推理 token / 可见输出 / 税成本 + taxRatio + 主因）
+                    ├─► 独立推理税预算水位（budget ok/warn/block，limit>0 时）
+                    ├─► 中文治理叙事（思考预算压缩 / 路由降级 / 切换非推理模型）
+                    └─► cost_guard_reasoning 只读工具 + 面板 reasoningTax 段
+
+        reasoningTaxAudit.enabled=true（0.18.0）
+              └─► reasoning-tax-audit.ts ◄── sampler（entry, sessionId）
+                    ├─► 会话维度 Top N 排行（sessionTopN，主因会话 + 占全局比例）
+                    ├─► 时间热力桶（bucketMinutes × heatBuckets，热力序列 + 峰值桶）
+                    ├─► 中文审计叙事（会话收敛 / 热点错峰 / 时段预算护栏）
+                    └─► cost_guard_reasoning_audit 只读工具 + 面板 reasoningTaxAudit 段
 ```
 
 ## 二次开发
@@ -430,6 +508,7 @@ npm pack           # 发布包预检
 - 新增预测策略：`core/budget.ts` 的 `PredictivePolicy` 是纯声明（projection/spike/preflight），决策逻辑为纯函数，直接加单测；harness 侧只需在 `harness/predictive.ts` 提供对应的事实构造器（如新的投影目标时刻解析器）。
 - 新增事件消费：在 `harness/` 加适配器（如 `harness/cache.ts` 的 `attachCacheMeter`），领域逻辑放 `core/`，保持核心零 DSH 依赖。
 - 扩展前沿套件：新台账/遥测/洞察能力先在 `core/` 实现纯领域模块（零 DSH），再在 `harness/frontier.ts` 的 `FrontierRuntime` 注册（`record` 入账路由 + `panel` 输出段 + `formatFrontierLines` 人读行），最后在 `index.ts` 的 `frontier` schema 加开关即可，未启用时零回归。
+- 扩展推理税治理/审计：新增归因维度（如按任务/按周）先在 `core/reasoning-tax*.ts` 实现纯领域账本（零 DSH，追加同一 entry 互不读写），再在 `harness/reasoning-tax*.ts` 注册 runtime（`append` 入账 + `panel` 段 + 只读工具 + `format*Lines` 人读行），最后在 `index.ts` 的 `reasoningTax*` schema 加配置，未启用时零回归。
 - 持久化：`core/store.ts` 定义 `CostSnapshot` 形状（含 `bands` 分带分布）；接入 `ctx.costGuard` 服务即可跨重启恢复。
 
 ## 与现有方案对比
@@ -445,6 +524,8 @@ npm pack           # 发布包预检
 
 | 版本 | 增量 |
 | --- | --- |
+| **0.18.0** | **多维思考税审计（Multi-Dimension Reasoning Tax Audit）：在 0.17.0 路由归因之上新增「会话维度 Top N 排行 + 时间热力桶」双切片审计——0.17.0 回答了「哪条路由在烧思考税」，0.18.0 回答「哪个会话在烧 / 一天中何时烧得最集中」。新增 core/reasoning-tax-audit.ts（零 DSH：会话维度按 sessionId 聚合推理 token/可见输出/税成本输出 Top N 排行（sessionTopN 默认 5）与主因会话 + 时间热力桶按 bucketMinutes 默认 60 分钟聚合、保留最近 heatBuckets 默认 24 个桶，输出热力序列与峰值桶 + 中文审计叙事（主因会话/热力峰值/会话思考预算收敛/热点错峰/时段预算护栏），与 0.17.0 路由账本正交互不读写），harness/reasoning-tax-audit.ts（ReasoningTaxAuditRuntime + 面板 reasoningTaxAudit 段 + 只读工具 cost_guard_reasoning_audit（市面无同类工具）+ formatReasoningTaxAuditLines 审计行）；默认关闭零回归（未启用与 0.17.0 完全一致）、core 零 DSH 保持；单测 404→419（+15：reasoning-tax-audit 9 + harness-reasoning-tax-audit 6）、tsc exit 0、build 成功、冒烟 17 节全过（新增 0.18.0 审计节，16→17）** |
+| **0.17.0** | **推理成本专项治理（Reasoning Tax Governance）：把思维链「思考税」从展示项升级为可治理对象——市面 DSH 成本插件（dsh-billing / dsh-cost-meter / dsh-cost-tracker 等）只统计输入/输出/缓存三通道，无人按推理 token（思维链/thinking）专项计量与治理，而 2026 行业共识指出推理 token 按输出价计费、常为可见输出的 5~20 倍，是账单最大的隐藏成本。新增 core/reasoning-tax.ts（零 DSH：按路由聚合推理 token/可见输出/税成本（推理 token × 输出价）+ 全局与逐路由思考税 taxRatio + 主因路由识别 + 独立推理税预算水位 ok/warn/block（limit>0 才启用，纯新增维度不干预既有 budgets 熔断语义）+ 中文治理叙事（思考预算压缩/路由降级/切换非推理模型）），harness/reasoning-tax.ts（ReasoningTaxRuntime + 面板 reasoningTax 段 + 只读工具 cost_guard_reasoning + formatReasoningTaxLines 治理行）；默认关闭零回归（未启用与 0.16.0 完全一致）、core 零 DSH 保持；单测 388→404（+16：reasoning-tax 8 + harness-reasoning-tax 8）、tsc exit 0、build 成功、冒烟 16 节全过（新增 0.17.0 推理税专项节，15→16）** |
 | **0.16.0** | **多租户成本解释视图（Multi-Tenant Cost Explanation View）：把成本归因从「会话/路由」推进到企业级「租户」维度——市面成本方案（LiteLLM/C1.ai/Azure/Snowflake）的归因止步于任务与模型视角，没有回答「钱是哪个团队/项目/工作区花的」，而 DSH 常被多租户共用同一实例；0.16.0 新增 core/tenant.ts（零 DSH：sessionId→租户解析器 mapping>prefix>regex + 未命中兜底内置 'default'、租户聚合四通道全量、租户间归因复用 rca 增量贡献分解主因/次因/噪声分级、租户内主因会话两级证据链、中文叙事），harness/tenant.ts（TenantRuntime current/delta 双模式 + 基线、面板 tenant 段、只读工具 cost_guard_tenant、formatTenantLines 多租户行）；默认关闭零回归（未启用与 0.15.0 完全一致）、core 零 DSH 保持；单测 369→388、tsc exit 0、ESLint 0、覆盖率门禁保持（全局 stmts 97.58%/branch 86.79%、store.ts 100%）、build 成功、冒烟 14→15 节全过** |
 | **0.15.0** | **根因解释接入告警通知（Explainable Alarm）：把「知道为什么」推进到告警现场——市面成本告警只会喊「超了」，0.15.0 在 Guard 告警/熔断触发时同一条通知输出「为什么超」的中文告警根因叙事（core/alert-explain.ts 零 DSH：首句 scope/水位/Δ + 会话/路由双视角主因各 1 条 + 可执行建议，单段纯文本与逐行双格式可转发 IM/桌面通知）；harness/alert.ts 的 attachAlertExplain 挂载在 onViolation 之后，复用 ExplainRuntime 基线语义——首次触发存量归因并沉淀基线、后续与告警前基线增量归因（回答「这次为什么超」）；onExplainAlarm 宿主回调可收结构化负载（scope/action/window/report/lines），回调抛错自动降级不影响熔断主流程；explain.alert.enabled 默认关闭，未启用时告警行为与 0.14.0 完全一致（零回归）、core 零 DSH 保持；单测 349→369、tsc/ESLint 0、覆盖率门禁保持（全局 stmts 97.61%/branch 87.35%、store.ts 100%）、build 成功、冒烟 13→14 节全过** |
 | 0.1.0 | 实时计量 + 四维预算 + 请求前熔断 + 成本工具 |
